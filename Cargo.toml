@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["mplayer", "mplayer-audio", "mplayer-core", "mplayer-ui"]
+
+[profile.release]
+# Link time optimization greatly reduces the .so/binary sizes.
+# It also makes optional #[inline] attributes on crate-exported methods unnecessary.
+lto = "fat"
+
+# DSP must keep up with the device even during development. Retain debug symbols
+# and checks while leaving the UI and application crates at their dev defaults.
+[profile.dev.package.mplayer-audio]
+opt-level = 2
+
+[workspace.dependencies]
+symphonia = { version = "0.6", features = ["mp3"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = [
+    "env-filter",
+    "std",
+    "json",
+] }
+tokio = { version = "1.36", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+test-log = { version = "0.2", features = ["trace"] }
+anyhow = { version = "1" }

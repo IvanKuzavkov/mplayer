@@ -1,0 +1,6 @@
+/target
+.DS_Store
+.zed
+VALIDATION.md
+scripts
+*.csv

@@ -1,0 +1,19 @@
+[package]
+name = "mplayer-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+test-log.workspace = true
+libsqlite3-sys = "=0.37"
+sqlx = { version = "0.9", features = [
+    "runtime-tokio",
+    "sqlite",
+    "macros",
+    "migrate",
+] }
+dirwalk = "1.1"
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+cuna = "0.7"

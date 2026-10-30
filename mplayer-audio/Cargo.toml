@@ -1,0 +1,16 @@
+[package]
+name = "mplayer-audio"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cpal = "0.18.2"
+mplayer-core = { version = "0.1.0", path = "../mplayer-core" }
+ringbuf = "0.5.3"
+rubato = "5.0.1"
+anyhow.workspace = true
+symphonia.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+dst-decoder = "=0.1.2"
+rayon = "1.12.0"
