@@ -4,6 +4,40 @@ fn device_name(device: &str) -> &str {
     device.rsplit_once(" [").map_or(device, |(name, _)| name)
 }
 
+fn device_label(ui: &egui::Ui, device: &mplayer_core::OutputDevice) -> egui::text::LayoutJob {
+    let mut label = egui::text::LayoutJob::default();
+    RichText::new(device_name(&device.id))
+        .color(ui.visuals().text_color())
+        .append_to(
+            &mut label,
+            ui.style(),
+            egui::FontSelection::Default,
+            egui::Align::Center,
+        );
+    if let Some(capabilities) = device.capabilities {
+        RichText::new(format!(
+            "\nPCM up to {} kHz · {}-bit{} · {} ch",
+            f64::from(capabilities.sample_rate) / 1000.0,
+            capabilities.bits_per_sample,
+            if capabilities.floating_point {
+                " float"
+            } else {
+                ""
+            },
+            capabilities.channels,
+        ))
+        .small()
+        .color(ui.visuals().weak_text_color())
+        .append_to(
+            &mut label,
+            ui.style(),
+            egui::FontSelection::Default,
+            egui::Align::Center,
+        );
+    }
+    label
+}
+
 fn player_slider(
     ui: &mut egui::Ui,
     value: &mut f64,
@@ -157,8 +191,36 @@ impl PlayerApp {
                 self.output_button = Some(audio_output_button.rect);
             }
             egui::Popup::menu(&audio_output_button).show(|ui| {
+                let labels: Vec<_> = playback
+                    .devices
+                    .iter()
+                    .map(|device| device_label(ui, device))
+                    .collect();
+                let width = labels
+                    .iter()
+                    .map(|label| ui.painter().layout_job(label.clone()).size().x)
+                    .chain(std::iter::once(
+                        ui.painter()
+                            .layout_no_wrap(
+                                "System default".into(),
+                                egui::TextStyle::Button.resolve(ui.style()),
+                                ui.visuals().text_color(),
+                            )
+                            .size()
+                            .x,
+                    ))
+                    .fold(0.0, f32::max)
+                    + 2.0 * ui.spacing().button_padding.x
+                    + ui.spacing().scroll.bar_width
+                    + ui.spacing().item_spacing.x;
+                let screen = ui.ctx().content_rect();
+                ui.set_width(width.min((screen.width() - 24.0).max(1.0)));
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                 egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
+                    .id_salt("output_devices")
+                    .max_height(320.0_f32.min(screen.height() * 0.6))
+                    .min_scrolled_height(0.0)
+                    .auto_shrink([false, true])
                     .show(ui, |ui| {
                         ui.label(
                             RichText::new("Output device")
@@ -172,16 +234,16 @@ impl PlayerApp {
                             self.submit(AppCommand::SetDevice(None));
                             ui.close();
                         }
-                        for device in &playback.devices {
+                        for (device, label) in playback.devices.iter().zip(labels) {
                             if ui
                                 .selectable_label(
-                                    playback.selected_device.as_ref() == Some(device),
-                                    device_name(device),
+                                    playback.selected_device.as_ref() == Some(&device.id),
+                                    label,
                                 )
-                                .on_hover_text(device)
+                                .on_hover_text(&device.id)
                                 .clicked()
                             {
-                                self.submit(AppCommand::SetDevice(Some(device.clone())));
+                                self.submit(AppCommand::SetDevice(Some(device.id.clone())));
                                 ui.close();
                             }
                         }

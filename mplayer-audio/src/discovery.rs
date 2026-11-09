@@ -1,10 +1,11 @@
 use std::{sync::Arc, time::Duration};
 
+use mplayer_core::OutputDevice;
 use tokio::sync::watch;
 
 pub(super) async fn run(
-    devices: watch::Sender<Vec<String>>,
-    enumerate: impl Fn() -> Vec<String> + Send + Sync + 'static,
+    devices: watch::Sender<Vec<OutputDevice>>,
+    enumerate: impl Fn() -> Vec<OutputDevice> + Send + Sync + 'static,
     refresh_interval: Duration,
 ) {
     let enumerate = Arc::new(enumerate);

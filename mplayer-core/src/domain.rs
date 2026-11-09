@@ -70,6 +70,36 @@ pub enum PlayMode {
     Shuffle,
 }
 
+/// An output's stable selection label and its highest OS-reported PCM configuration.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OutputDevice {
+    pub id: String,
+    pub capabilities: Option<OutputDeviceCapabilities>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputDeviceCapabilities {
+    pub sample_rate: u32,
+    pub bits_per_sample: u16,
+    pub channels: u16,
+    pub floating_point: bool,
+}
+
+impl From<String> for OutputDevice {
+    fn from(id: String) -> Self {
+        Self {
+            id,
+            capabilities: None,
+        }
+    }
+}
+
+impl From<&str> for OutputDevice {
+    fn from(id: &str) -> Self {
+        id.to_owned().into()
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PlaybackSnapshot {
     /// Identifies the most recent explicit Load, excluding automatic next-track transitions.
@@ -84,7 +114,7 @@ pub struct PlaybackSnapshot {
     pub output_rate: u32,
     pub device: String,
     pub selected_device: Option<String>,
-    pub devices: Vec<String>,
+    pub devices: Vec<OutputDevice>,
     pub volume: f32,
     pub underruns: u64,
     pub error: Option<String>,

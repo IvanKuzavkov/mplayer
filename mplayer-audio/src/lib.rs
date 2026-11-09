@@ -11,7 +11,9 @@ pub use decoder::SymphoniaProbe;
 
 use decoder::Decoder;
 use dsp::Converter;
-use mplayer_core::{AudioCommand, PlaybackSnapshot, PlaybackState, Result, Track, Wake};
+use mplayer_core::{
+    AudioCommand, OutputDevice, PlaybackSnapshot, PlaybackState, Result, Track, Wake,
+};
 use output::{Output, RateSelection};
 use pcm::PcmFormat;
 use std::{
@@ -220,7 +222,7 @@ struct Worker {
     snapshot: PlaybackSnapshot,
     wake: Wake,
     selected_device: Option<String>,
-    device_updates: watch::Receiver<Vec<String>>,
+    device_updates: watch::Receiver<Vec<OutputDevice>>,
     recovery: Option<Recovery>,
     #[cfg(test)]
     output_factory: Option<OutputFactory>,
@@ -241,7 +243,7 @@ impl Worker {
         sender: watch::Sender<PlaybackSnapshot>,
         wake: Wake,
         stop: Arc<AtomicBool>,
-        mut device_updates: watch::Receiver<Vec<String>>,
+        mut device_updates: watch::Receiver<Vec<OutputDevice>>,
     ) -> Self {
         let devices = device_updates.borrow_and_update().clone();
         Self {
@@ -275,7 +277,7 @@ impl Worker {
         sender: watch::Sender<PlaybackSnapshot>,
         wake: Wake,
         stop: Arc<AtomicBool>,
-        devices: Vec<String>,
+        devices: Vec<OutputDevice>,
     ) -> Self {
         Self::new(sender, wake, stop, watch::channel(devices).1)
     }

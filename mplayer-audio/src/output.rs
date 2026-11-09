@@ -9,7 +9,7 @@ use cpal::{
     FromSample, SampleFormat, SizedSample, StreamConfig, SupportedStreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
-use mplayer_core::Result;
+use mplayer_core::{OutputDevice, OutputDeviceCapabilities, Result};
 use ringbuf::{HeapCons, HeapProd, HeapRb, traits::*};
 
 #[derive(Default)]
@@ -62,11 +62,49 @@ pub(crate) struct Output {
     pub sample_format: SampleFormat,
 }
 
-pub(crate) fn devices() -> Vec<String> {
+pub(crate) fn devices() -> Vec<OutputDevice> {
     cpal::default_host()
         .output_devices()
-        .map(|devices| devices.map(|device| device_label(&device)).collect())
+        .map(|devices| {
+            devices
+                .map(|device| OutputDevice {
+                    id: device_label(&device),
+                    capabilities: device
+                        .supported_output_configs()
+                        .ok()
+                        .and_then(capabilities),
+                })
+                .collect()
+        })
         .unwrap_or_default()
+}
+
+fn capabilities(
+    configs: impl IntoIterator<Item = cpal::SupportedStreamConfigRange>,
+) -> Option<OutputDeviceCapabilities> {
+    configs
+        .into_iter()
+        .filter(|config| {
+            supported_sample_format(config.sample_format())
+                && config.channels() > 0
+                && config.max_sample_rate() > 0
+                && config.max_sample_rate() < u32::MAX
+                && config.min_sample_rate() <= config.max_sample_rate()
+        })
+        .max_by_key(|config| {
+            (
+                config.max_sample_rate(),
+                config.sample_format().bits_per_sample(),
+                !config.sample_format().is_float(),
+                config.channels(),
+            )
+        })
+        .map(|config| OutputDeviceCapabilities {
+            sample_rate: config.max_sample_rate(),
+            bits_per_sample: config.sample_format().bits_per_sample() as u16,
+            channels: config.channels(),
+            floating_point: config.sample_format().is_float(),
+        })
 }
 
 fn device_label(device: &cpal::Device) -> String {

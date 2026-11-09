@@ -66,10 +66,10 @@ async fn dac_playback_diagnostics() {
     let selected = std::env::var("MPLAYER_DAC_BENCH_DEVICE").ok().map(|name| {
         let matching: Vec<_> = devices
             .iter()
-            .filter(|label| label.contains(&name))
+            .filter(|device| device.id.contains(&name))
             .collect();
         assert_eq!(matching.len(), 1, "Choose one device from {devices:?}");
-        matching[0].clone()
+        matching[0].id.clone()
     });
     let mut worker = Worker::with_devices(
         sender,
@@ -1059,7 +1059,7 @@ fn precision_reducing_output_falls_back_without_stopping_playback() {
     assert!(worker.snapshot.error.is_none());
 }
 
-fn update_devices(worker: &mut Worker, devices: Vec<String>) {
+fn update_devices(worker: &mut Worker, devices: Vec<OutputDevice>) {
     let (sender, receiver) = watch::channel(devices);
     drop(sender);
     worker.device_updates = receiver;
@@ -1145,7 +1145,10 @@ fn selecting_replacement_output_preserves_disconnected_track_position_and_queue(
         Some("Replacement output")
     );
     assert_eq!(worker.snapshot.device, "Replacement output");
-    assert_eq!(worker.snapshot.devices, ["Replacement output"]);
+    assert_eq!(
+        worker.snapshot.devices,
+        [OutputDevice::from("Replacement output")]
+    );
     assert_eq!(worker.snapshot.state, PlaybackState::Paused);
     assert_eq!(worker.snapshot.position_ms, 100);
     assert_eq!(worker.snapshot.track.as_ref().unwrap().id, 1);
