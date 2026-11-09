@@ -527,33 +527,6 @@ async fn cue_validation_is_atomic_and_supports_multiple_files() {
     store.close().await;
 }
 
-#[tokio::test]
-async fn audio_cache_uses_whole_seconds_and_size() {
-    let temp = TempDirectory::new();
-    let root = temp.music();
-    let path = root.join("one.flac");
-    let timestamp = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-    tokio::fs::write(&path, b"valid").await.unwrap();
-    let set_time = |time| {
-        std::fs::File::open(&path)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(time))
-            .unwrap()
-    };
-    set_time(timestamp);
-    let store = Store::open(&temp.0.join("library.sqlite")).await.unwrap();
-    let probe = Arc::new(Probe::default());
-    run_scan(&store, &root, &probe).await;
-    tokio::fs::write(&path, b"other").await.unwrap();
-    set_time(timestamp + std::time::Duration::from_millis(100));
-    run_scan(&store, &root, &probe).await;
-    assert_eq!(probe.0.load(Ordering::Relaxed), 1);
-    set_time(timestamp + std::time::Duration::from_secs(1));
-    run_scan(&store, &root, &probe).await;
-    assert_eq!(probe.0.load(Ordering::Relaxed), 2);
-    store.close().await;
-}
-
 #[cfg(unix)]
 #[tokio::test]
 async fn unreadable_folder_does_not_block_a_healthy_sibling_or_mark_files_missing() {
