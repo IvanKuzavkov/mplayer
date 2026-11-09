@@ -1,5 +1,6 @@
 //! Local audio decoding and native output behind a bounded command interface.
 mod decoder;
+mod discovery;
 mod dsd;
 mod dsp;
 mod output;
@@ -11,7 +12,7 @@ pub use decoder::SymphoniaProbe;
 use decoder::Decoder;
 use dsp::Converter;
 use mplayer_core::{AudioCommand, PlaybackSnapshot, PlaybackState, Result, Track, Wake};
-use output::Output;
+use output::{Output, RateSelection};
 use pcm::PcmFormat;
 use std::{
     collections::VecDeque,
@@ -24,17 +25,22 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::watch;
+use tracing::Instrument;
 
 pub struct AudioEngine {
     sender: SyncSender<AudioCommand>,
     snapshots: watch::Receiver<PlaybackSnapshot>,
     thread: Option<JoinHandle<()>>,
+    discovery: tokio::task::JoinHandle<()>,
     stop: Arc<AtomicBool>,
 }
 
 impl AudioEngine {
+    /// Requires an active Tokio runtime for background output-device discovery.
     #[tracing::instrument(skip_all, err)]
     pub fn start(wake: Wake) -> Result<Self> {
+        let runtime = tokio::runtime::Handle::try_current()?;
+        let (device_sender, device_updates) = watch::channel(Vec::new());
         let (sender, receiver) = mpsc::sync_channel(64);
         let (snapshots_tx, snapshots) = watch::channel(PlaybackSnapshot {
             volume: 1.0,
@@ -46,12 +52,19 @@ impl AudioEngine {
         let thread = thread::Builder::new()
             .name("mplayer-audio".into())
             .spawn(move || {
-                parent.in_scope(|| Worker::new(snapshots_tx, wake, worker_stop).run(receiver));
+                parent.in_scope(|| {
+                    Worker::new(snapshots_tx, wake, worker_stop, device_updates).run(receiver)
+                });
             })?;
+        let discovery = runtime.spawn(
+            discovery::run(device_sender, output::devices, Duration::from_secs(3))
+                .in_current_span(),
+        );
         Ok(Self {
             sender,
             snapshots,
             thread: Some(thread),
+            discovery,
             stop,
         })
     }
@@ -63,6 +76,7 @@ impl AudioEngine {
     }
     #[tracing::instrument(skip_all, err)]
     pub fn shutdown(mut self) -> Result<()> {
+        self.discovery.abort();
         self.stop.store(true, Ordering::Relaxed);
         let _ = self.sender.try_send(AudioCommand::Shutdown);
         if let Some(thread) = self.thread.take() {
@@ -82,6 +96,7 @@ impl AudioEngine {
 }
 impl Drop for AudioEngine {
     fn drop(&mut self) {
+        self.discovery.abort();
         if let Some(thread) = self.thread.take() {
             self.stop.store(true, Ordering::Relaxed);
             let _ = self.sender.try_send(AudioCommand::Shutdown);
@@ -110,6 +125,14 @@ impl Prepared {
         }
         track.missing = false;
         Ok(Self { track, decoder })
+    }
+
+    fn rate_selection(&self) -> RateSelection {
+        if self.decoder.is_dsd() {
+            RateSelection::Highest
+        } else {
+            RateSelection::Native
+        }
     }
 }
 struct Session {
@@ -178,6 +201,7 @@ struct Segment {
     end_sample: Option<u64>,
     base_ms: u64,
     pcm_rate: u32,
+    rate_selection: RateSelection,
 }
 
 #[derive(Clone)]
@@ -189,14 +213,14 @@ struct Recovery {
 }
 
 #[cfg(test)]
-type OutputFactory = fn(u32, usize, PcmFormat, Option<&str>, f32) -> Result<Output>;
+type OutputFactory = fn(u32, usize, PcmFormat, RateSelection, Option<&str>, f32) -> Result<Output>;
 
 struct Worker {
     sender: watch::Sender<PlaybackSnapshot>,
     snapshot: PlaybackSnapshot,
     wake: Wake,
     selected_device: Option<String>,
-    enumerate_devices: fn() -> Vec<String>,
+    device_updates: watch::Receiver<Vec<String>>,
     recovery: Option<Recovery>,
     #[cfg(test)]
     output_factory: Option<OutputFactory>,
@@ -208,20 +232,18 @@ struct Worker {
     written: u64,
     drain_at: Option<Instant>,
     last_publish: Instant,
-    last_devices: Instant,
+    last_diagnostics: Instant,
     total_underruns: u64,
     stop: Arc<AtomicBool>,
 }
 impl Worker {
-    fn new(sender: watch::Sender<PlaybackSnapshot>, wake: Wake, stop: Arc<AtomicBool>) -> Self {
-        Self::with_devices(sender, wake, stop, output::devices())
-    }
-    fn with_devices(
+    fn new(
         sender: watch::Sender<PlaybackSnapshot>,
         wake: Wake,
         stop: Arc<AtomicBool>,
-        devices: Vec<String>,
+        mut device_updates: watch::Receiver<Vec<String>>,
     ) -> Self {
+        let devices = device_updates.borrow_and_update().clone();
         Self {
             sender,
             snapshot: PlaybackSnapshot {
@@ -231,7 +253,7 @@ impl Worker {
             },
             wake,
             selected_device: None,
-            enumerate_devices: output::devices,
+            device_updates,
             recovery: None,
             #[cfg(test)]
             output_factory: None,
@@ -243,10 +265,19 @@ impl Worker {
             written: 0,
             drain_at: None,
             last_publish: Instant::now(),
-            last_devices: Instant::now(),
+            last_diagnostics: Instant::now(),
             total_underruns: 0,
             stop,
         }
+    }
+    #[cfg(test)]
+    fn with_devices(
+        sender: watch::Sender<PlaybackSnapshot>,
+        wake: Wake,
+        stop: Arc<AtomicBool>,
+        devices: Vec<String>,
+    ) -> Self {
+        Self::new(sender, wake, stop, watch::channel(devices).1)
     }
     #[tracing::instrument(skip_all)]
     fn run(mut self, receiver: Receiver<AudioCommand>) {
@@ -281,23 +312,13 @@ impl Worker {
         tracing::info!("Audio worker stopped");
     }
     fn refresh_devices(&mut self) {
-        if self.last_devices.elapsed() < Duration::from_secs(3) {
+        let devices = self.device_updates.borrow_and_update();
+        if self.snapshot.devices == *devices {
             return;
         }
-        let started = Instant::now();
-        let devices = (self.enumerate_devices)();
-        if started.elapsed() >= Duration::from_millis(50) {
-            tracing::warn!(
-                elapsed_ms = started.elapsed().as_millis(),
-                queued_ms = self.queued_ms(),
-                "Audio device enumeration stalled the worker"
-            );
-        }
-        if self.snapshot.devices != devices {
-            self.snapshot.devices = devices;
-            self.publish();
-        }
-        self.last_devices = Instant::now();
+        self.snapshot.devices.clone_from(&devices);
+        drop(devices);
+        self.publish();
     }
     #[tracing::instrument(skip_all, fields(command = command_name(&command)), err)]
     fn command(&mut self, command: AudioCommand) -> Result<()> {
@@ -407,7 +428,7 @@ impl Worker {
                 }
             }
             AudioCommand::SetDevice(device) => {
-                self.snapshot.devices = (self.enumerate_devices)();
+                self.refresh_devices();
                 if self.selected_device == device {
                     return Ok(());
                 }
@@ -472,13 +493,20 @@ impl Worker {
         })
     }
 
-    fn open_output(&mut self, rate: u32, channels: usize, format: PcmFormat) -> Result<Output> {
+    fn open_output(
+        &mut self,
+        rate: u32,
+        channels: usize,
+        format: PcmFormat,
+        rate_selection: RateSelection,
+    ) -> Result<Output> {
         #[cfg(test)]
         if let Some(factory) = self.output_factory {
             return factory(
                 rate,
                 channels,
                 format,
+                rate_selection,
                 self.selected_device.as_deref(),
                 self.snapshot.volume,
             );
@@ -487,6 +515,7 @@ impl Worker {
             rate,
             channels,
             format,
+            rate_selection,
             self.selected_device.as_deref(),
             self.snapshot.volume,
         )
@@ -505,6 +534,7 @@ impl Worker {
             prepared.decoder.pcm_spec().rate,
             usize::from(prepared.decoder.pcm_spec().channels),
             prepared.decoder.pcm_format(),
+            prepared.rate_selection(),
         )?;
         let session = Session::new(prepared, output.rate, output.channels)?;
         self.snapshot.track = Some(session.prepared.track.clone());
@@ -527,9 +557,11 @@ impl Worker {
             end_sample: None,
             base_ms: position,
             pcm_rate: session.prepared.decoder.pcm_spec().rate,
+            rate_selection: session.prepared.rate_selection(),
         });
         self.session = Some(session);
         self.output = Some(output);
+        self.last_diagnostics = Instant::now();
         self.next = next;
         self.written = 0;
         self.drain_at = None;
@@ -572,9 +604,10 @@ impl Worker {
             return false;
         };
         let spec = prepared.decoder.pcm_spec();
-        self.segments.back().map(|segment| segment.pcm_rate) == Some(spec.rate)
-            && (usize::from(spec.channels) == output.channels
-                || (spec.channels == 1 && output.channels == 2))
+        self.segments.back().is_some_and(|segment| {
+            segment.pcm_rate == spec.rate && segment.rate_selection == prepared.rate_selection()
+        }) && (usize::from(spec.channels) == output.channels
+            || (spec.channels == 1 && output.channels == 2))
             && spec.format.preserved_by(output.sample_format)
     }
 
@@ -587,7 +620,7 @@ impl Worker {
             source_bits = metadata.bit_depth,
             decoded_format = ?spec.format,
             decoded_rate = spec.rate,
-            dsd_to_pcm = metadata.codec == "dsd",
+            dsd_to_pcm = prepared.decoder.is_dsd(),
             output_format = %output.sample_format,
             source_rate = metadata.sample_rate,
             output_rate = output.rate,
@@ -622,6 +655,7 @@ impl Worker {
             end_sample: None,
             base_ms: 0,
             pcm_rate: session.prepared.decoder.pcm_spec().rate,
+            rate_selection: session.prepared.rate_selection(),
         });
         output.state.ending.store(false, Ordering::Relaxed);
         self.drain_at = None;
@@ -668,6 +702,7 @@ impl Worker {
             end_sample: None,
             base_ms: 0,
             pcm_rate: session.prepared.decoder.pcm_spec().rate,
+            rate_selection: session.prepared.rate_selection(),
         });
         self.next = None;
         self.session = Some(session);
@@ -890,9 +925,37 @@ impl Worker {
                     device = %output.device,
                     rate = output.rate,
                     callback_gap_ms = gap as f64 / 1_000_000.0,
+                    position_ms = self.snapshot.position_ms,
                     queued_ms = self.queued_ms(),
                     "Audio device callback delayed"
                 );
+            }
+            if self.snapshot.state == PlaybackState::Playing
+                && self.last_diagnostics.elapsed() >= Duration::from_secs(5)
+            {
+                let minimum = output
+                    .state
+                    .min_queued_samples
+                    .swap(u64::MAX, Ordering::Relaxed);
+                let max_interval = output
+                    .state
+                    .max_callback_interval_ns
+                    .swap(0, Ordering::Relaxed);
+                tracing::info!(
+                    position_ms = self.snapshot.position_ms,
+                    queued_ms = self.queued_ms(),
+                    min_queued_ms = (minimum != u64::MAX).then(|| {
+                        minimum as f64 * 1000.0 / output.channels as f64 / f64::from(output.rate)
+                    }),
+                    max_callback_interval_ms = max_interval as f64 / 1_000_000.0,
+                    callbacks = output.state.callbacks.load(Ordering::Relaxed),
+                    buffer_underruns = output.state.underruns.load(Ordering::Relaxed),
+                    device_underruns = output.state.device_underruns.load(Ordering::Relaxed),
+                    device = %output.device,
+                    rate = output.rate,
+                    "Audio playback diagnostics"
+                );
+                self.last_diagnostics = Instant::now();
             }
         }
         let underruns = self.total_underruns
@@ -903,6 +966,7 @@ impl Worker {
         if underruns != self.snapshot.underruns {
             tracing::warn!(
                 underruns,
+                position_ms = self.snapshot.position_ms,
                 buffer_underruns = self.output.as_ref().map_or(0, |output| output.state.underruns.load(Ordering::Relaxed)),
                 device_underruns = self.output.as_ref().map_or(0, |output| output.state.device_underruns.load(Ordering::Relaxed)),
                 queued_ms = self.queued_ms(),

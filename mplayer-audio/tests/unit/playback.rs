@@ -42,9 +42,9 @@ fn playback_throughput() {
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 
-#[test]
+#[tokio::test]
 #[ignore = "manual muted hardware playback; set MPLAYER_DAC_BENCH_FILE and optionally MPLAYER_DAC_BENCH_DEVICE"]
-fn dac_playback_diagnostics() {
+async fn dac_playback_diagnostics() {
     let Some(path) = std::env::var_os("MPLAYER_DAC_BENCH_FILE") else {
         eprintln!("Set MPLAYER_DAC_BENCH_FILE to run muted hardware playback");
         return;
@@ -52,7 +52,17 @@ fn dac_playback_diagnostics() {
     let seconds: u64 = std::env::var("MPLAYER_DAC_BENCH_SECONDS")
         .map_or(15, |value| value.parse().expect("invalid duration"));
     let (sender, _) = watch::channel(PlaybackSnapshot::default());
-    let devices = output::devices();
+    let (device_sender, mut device_updates) = watch::channel(Vec::new());
+    let discovery = tokio::spawn(crate::discovery::run(
+        device_sender,
+        output::devices,
+        Duration::from_secs(3),
+    ));
+    tokio::time::timeout(Duration::from_secs(10), device_updates.changed())
+        .await
+        .expect("No output devices discovered within 10 seconds")
+        .unwrap();
+    let devices = device_updates.borrow_and_update().clone();
     let selected = std::env::var("MPLAYER_DAC_BENCH_DEVICE").ok().map(|name| {
         let matching: Vec<_> = devices
             .iter()
@@ -67,6 +77,7 @@ fn dac_playback_diagnostics() {
         Arc::new(AtomicBool::new(false)),
         devices,
     );
+    worker.device_updates = device_updates;
     worker.selected_device = selected;
     worker.snapshot.volume = 0.0;
     let track = Track {
@@ -88,13 +99,10 @@ fn dac_playback_diagnostics() {
     let started = Instant::now();
     let mut max_gap = 0;
     let mut last_report = Instant::now();
-    let mut max_enumeration_ms = 0;
     while started.elapsed() < Duration::from_secs(seconds) {
-        thread::sleep(Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(5)).await;
         worker.tick().unwrap();
-        let refresh = Instant::now();
         worker.refresh_devices();
-        max_enumeration_ms = max_enumeration_ms.max(refresh.elapsed().as_millis());
         max_gap = max_gap.max(state.max_callback_gap_ns.load(Ordering::Relaxed));
         if last_report.elapsed() >= Duration::from_secs(1) {
             eprintln!(
@@ -114,6 +122,8 @@ fn dac_playback_diagnostics() {
             worker.publish();
         }
     }
+    discovery.abort();
+    let _ = discovery.await;
     assert!(
         state.callbacks.load(Ordering::Relaxed) > 0,
         "No device callbacks"
@@ -123,7 +133,7 @@ fn dac_playback_diagnostics() {
         "Device stream failed"
     );
     eprintln!(
-        "DAC_RESULT seconds={seconds} position_ms={} buffer_underruns={} device_underruns={} max_gap_ms={:.3} max_enumeration_ms={max_enumeration_ms}",
+        "DAC_RESULT seconds={seconds} position_ms={} buffer_underruns={} device_underruns={} max_gap_ms={:.3}",
         worker.position(),
         state.underruns.load(Ordering::Relaxed),
         state.device_underruns.load(Ordering::Relaxed),
@@ -212,12 +222,251 @@ fn worker_at_rate(
         end_sample: None,
         base_ms: 0,
         pcm_rate: session.prepared.decoder.pcm_spec().rate,
+        rate_selection: session.prepared.rate_selection(),
     });
     worker.session = Some(session);
     worker.next = next;
     worker.output = Some(output);
     worker.produce().unwrap();
     (worker, consumer, state)
+}
+
+#[test]
+#[ignore = "manual offline DSD callback correctness; set MPLAYER_DSD_CHECK_FILE"]
+fn dsd_file_callback_correctness() {
+    use cpal::Sample;
+
+    let Some(path) = std::env::var_os("MPLAYER_DSD_CHECK_FILE") else {
+        eprintln!("Set MPLAYER_DSD_CHECK_FILE for offline playback-queue verification");
+        return;
+    };
+    let starts: Vec<u64> = std::env::var("MPLAYER_DSD_CHECK_STARTS")
+        .unwrap_or_else(|_| "105,116".into())
+        .split(',')
+        .map(|value| value.parse().expect("invalid window start"))
+        .collect();
+    let seconds: u64 = std::env::var("MPLAYER_DSD_CHECK_SECONDS")
+        .map_or(10, |value| value.parse().expect("invalid window length"));
+    let end_seconds = starts.iter().max().unwrap() + seconds;
+    assert!(end_seconds > 0 && end_seconds <= 3600);
+    for period in [883, 3528] {
+        let track = Track {
+            id: 1,
+            path: path.clone().into(),
+            metadata: TrackMetadata::default(),
+            missing: false,
+            segment: None,
+        };
+        let mut reference = Decoder::open(&track.path).unwrap();
+        let spec = reference.pcm_spec();
+        assert_eq!(spec.rate, crate::dsd::PCM_RATE);
+        let channels = usize::from(spec.channels);
+        let end = end_seconds as usize * spec.rate as usize * channels;
+        let (mut worker, mut consumer, callback) = worker_at_rate(track, None, spec.rate, channels);
+        worker.output.as_mut().unwrap().sample_format = cpal::SampleFormat::I32;
+        let mut decoded = Vec::new();
+        let mut decoded_offset = 0;
+        let mut rendered = vec![0_i32; period * channels];
+        let mut checked = 0;
+        while checked < end {
+            let count = rendered.len().min(end - checked);
+            output::test_consume(&mut consumer, &mut rendered[..count], channels, &callback);
+            assert_eq!(callback.underruns.load(Ordering::Relaxed), 0);
+            for &actual in &rendered[..count] {
+                if decoded_offset == decoded.len() {
+                    assert!(reference.next(&mut decoded).unwrap());
+                    decoded_offset = 0;
+                }
+                let sample = decoded[decoded_offset];
+                assert!(sample.is_finite());
+                let expected = i32::from_sample(sample.clamp(-1.0, 1.0 - 2.0_f64.powi(-31)));
+                assert_eq!(
+                    actual,
+                    expected,
+                    "period={period} frame={} channel={}",
+                    checked / channels,
+                    checked % channels
+                );
+                checked += 1;
+                decoded_offset += 1;
+            }
+            worker.tick().unwrap();
+        }
+        assert_eq!(callback.consumed.load(Ordering::Relaxed), end as u64);
+        eprintln!(
+            "DSD_CALLBACK_CORRECTNESS period={period} rate={} channels={channels} seconds={end_seconds} matching_i32_samples={checked}",
+            spec.rate
+        );
+    }
+}
+
+#[test]
+fn periodic_diagnostics_reset_measurements_without_changing_playback() {
+    let (_fixture, track) = fixture(1, 8192);
+    let (mut worker, mut consumer, callback) = worker(track, None);
+    let mut samples = [0.0_f64; 800];
+    output::test_consume(&mut consumer, &mut samples, 1, &callback);
+    callback
+        .max_callback_interval_ns
+        .store(7_000_000, Ordering::Relaxed);
+    assert!(callback.min_queued_samples.load(Ordering::Relaxed) < u64::MAX);
+    assert_eq!(
+        callback.max_callback_interval_ns.load(Ordering::Relaxed),
+        7_000_000
+    );
+    worker.last_diagnostics = Instant::now() - Duration::from_secs(5);
+    let queued_ms = worker.queued_ms();
+    let written = worker.written;
+
+    worker.publish();
+
+    assert_eq!(
+        callback.min_queued_samples.load(Ordering::Relaxed),
+        u64::MAX
+    );
+    assert_eq!(callback.max_callback_interval_ns.load(Ordering::Relaxed), 0);
+    assert!(worker.last_diagnostics.elapsed() < Duration::from_secs(5));
+    assert_eq!(worker.snapshot.state, PlaybackState::Playing);
+    assert_eq!(worker.snapshot.position_ms, 100);
+    assert_eq!(worker.queued_ms(), queued_ms);
+    assert_eq!(worker.written, written);
+    assert!(Arc::ptr_eq(
+        &worker.output.as_ref().unwrap().state,
+        &callback
+    ));
+}
+
+#[test]
+fn device_updates_publish_only_the_latest_list_and_wake() {
+    let (sender, mut snapshots) = watch::channel(PlaybackSnapshot::default());
+    let wakes = Arc::new(AtomicU64::new(0));
+    let wake_count = wakes.clone();
+    let mut worker = Worker::with_devices(
+        sender,
+        Arc::new(move || {
+            wake_count.fetch_add(1, Ordering::Relaxed);
+        }),
+        Arc::new(AtomicBool::new(false)),
+        Vec::new(),
+    );
+    let (devices, updates) = watch::channel(Vec::new());
+    worker.device_updates = updates;
+    devices.send(vec!["Old output".into()]).unwrap();
+    let latest = vec!["Headphones".into(), "Replacement output".into()];
+    devices.send(latest.clone()).unwrap();
+
+    worker.refresh_devices();
+
+    assert_eq!(worker.snapshot.devices, latest);
+    assert!(snapshots.has_changed().unwrap());
+    assert_eq!(snapshots.borrow_and_update().devices, latest);
+    assert!(!worker.device_updates.has_changed().unwrap());
+    assert_eq!(wakes.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn unchanged_device_updates_do_not_publish_or_wake() {
+    let initial = vec!["Headphones".into()];
+    let (sender, mut snapshots) = watch::channel(PlaybackSnapshot::default());
+    let wakes = Arc::new(AtomicU64::new(0));
+    let wake_count = wakes.clone();
+    let mut worker = Worker::with_devices(
+        sender,
+        Arc::new(move || {
+            wake_count.fetch_add(1, Ordering::Relaxed);
+        }),
+        Arc::new(AtomicBool::new(false)),
+        initial.clone(),
+    );
+    let (devices, updates) = watch::channel(initial.clone());
+    worker.device_updates = updates;
+    worker.publish();
+    snapshots.borrow_and_update();
+    let last_publish = worker.last_publish;
+    let wake_count = wakes.load(Ordering::Relaxed);
+
+    worker.refresh_devices();
+    for _ in 0..2 {
+        devices.send(initial.clone()).unwrap();
+        worker.refresh_devices();
+        assert!(!worker.device_updates.has_changed().unwrap());
+    }
+    worker.refresh_devices();
+
+    assert_eq!(worker.snapshot.devices, initial);
+    assert!(!snapshots.has_changed().unwrap());
+    assert_eq!(worker.last_publish, last_publish);
+    assert_eq!(wakes.load(Ordering::Relaxed), wake_count);
+}
+
+#[test]
+fn closed_device_updates_publish_the_latest_list() {
+    let (sender, mut snapshots) = watch::channel(PlaybackSnapshot::default());
+    let mut worker = Worker::with_devices(
+        sender,
+        Arc::new(|| {}),
+        Arc::new(AtomicBool::new(false)),
+        Vec::new(),
+    );
+    let latest = vec!["Replacement output".into()];
+
+    update_devices(&mut worker, latest.clone());
+
+    assert_eq!(worker.snapshot.devices, latest);
+    assert!(snapshots.has_changed().unwrap());
+    assert_eq!(snapshots.borrow_and_update().devices, latest);
+    worker.refresh_devices();
+    assert!(!snapshots.has_changed().unwrap());
+}
+
+#[test]
+fn device_discovery_preserves_selection_stream_and_position_while_playing() {
+    let (_first, first) = fixture(1, 8192);
+    let (_second, second) = fixture(2, -16384);
+    let (mut worker, mut consumer, callback) = worker(first, Some(second));
+    let selected = Some("Headphones".to_string());
+    worker.selected_device = selected.clone();
+    worker.snapshot.selected_device = selected.clone();
+    worker.output.as_mut().unwrap().device = "Headphones".into();
+    worker.snapshot.device = "Headphones".into();
+    let (devices, updates) = watch::channel(vec!["Headphones".into()]);
+    worker.device_updates = updates;
+    let mut rendered = [0.0_f64; 800];
+    output::test_consume(&mut consumer, &mut rendered, 1, &callback);
+    worker.publish();
+    let written = worker.written;
+    let queued_ms = worker.queued_ms();
+
+    for latest in [vec!["Replacement output".into()], Vec::new()] {
+        devices.send(latest.clone()).unwrap();
+        if latest.is_empty() {
+            worker
+                .command(AudioCommand::SetDevice(selected.clone()))
+                .unwrap();
+        } else {
+            worker.refresh_devices();
+        }
+
+        assert_eq!(worker.snapshot.devices, latest);
+        assert_eq!(worker.selected_device, selected);
+        assert_eq!(worker.snapshot.selected_device, selected);
+        assert_eq!(worker.snapshot.device, "Headphones");
+        assert_eq!(worker.snapshot.state, PlaybackState::Playing);
+        assert_eq!(worker.position(), 100);
+        assert_eq!(worker.snapshot.position_ms, 100);
+        assert!(Arc::ptr_eq(
+            &worker.output.as_ref().unwrap().state,
+            &callback
+        ));
+        assert!(!callback.paused.load(Ordering::Relaxed));
+        assert_eq!(worker.written, written);
+        assert_eq!(worker.queued_ms(), queued_ms);
+        assert_eq!(worker.snapshot.track.as_ref().unwrap().id, 1);
+        assert_eq!(worker.future_track().unwrap().id, 2);
+        assert!(worker.snapshot.error.is_none());
+        assert!(worker.snapshot.notification.is_none());
+    }
+    assert_eq!(rendered, [0.25; 800]);
 }
 
 #[test]
@@ -395,11 +644,13 @@ fn dsd_load_and_seek_negotiate_pcm_and_resample_for_device_fallback() {
         Arc::new(AtomicBool::new(false)),
         Vec::new(),
     );
-    worker.output_factory = Some(|rate, channels, format, selected, volume| {
+    worker.output_factory = Some(|rate, channels, format, rate_selection, selected, volume| {
         assert_eq!(rate, dsd::PCM_RATE);
         assert_eq!(channels, 2);
         assert_eq!(format, PcmFormat::Float(64));
-        let mut output = recovery_output(48_000, channels, format, selected, volume)?;
+        assert_eq!(rate_selection, RateSelection::Highest);
+        let mut output =
+            recovery_output(48_000, channels, format, rate_selection, selected, volume)?;
         output.sample_format = cpal::SampleFormat::F32;
         Ok(output)
     });
@@ -423,6 +674,186 @@ fn dsd_load_and_seek_negotiate_pcm_and_resample_for_device_fallback() {
     assert!(worker.snapshot.error.is_none());
     worker.command(AudioCommand::Resume).unwrap();
     assert_eq!(worker.snapshot.state, PlaybackState::Playing);
+}
+
+#[test]
+fn dsd_load_and_paused_seek_resample_to_384000_with_i32_output() {
+    let samples = 2_822_400_u64 / 10;
+    let raw = [0xdf, 0x05].repeat(samples as usize / 8);
+    let file = dsd::tests::Fixture::new(
+        &dsd::tests::dsf(2_822_400, 2, samples, true, &raw, &[]),
+        "dsf",
+    );
+    let track = Track {
+        id: 1,
+        path: file.0.clone(),
+        metadata: TrackMetadata::default(),
+        missing: false,
+        segment: None,
+    };
+    let (sender, _) = watch::channel(PlaybackSnapshot::default());
+    let mut worker = Worker::with_devices(
+        sender,
+        Arc::new(|| {}),
+        Arc::new(AtomicBool::new(false)),
+        Vec::new(),
+    );
+    worker.output_factory = Some(|rate, channels, format, rate_selection, selected, volume| {
+        assert_eq!(rate, dsd::PCM_RATE);
+        assert_eq!(channels, 2);
+        assert_eq!(format, PcmFormat::Float(64));
+        assert_eq!(rate_selection, RateSelection::Highest);
+        precision_output(384_000, channels, format, rate_selection, selected, volume)
+    });
+    worker
+        .load(Prepared::open(track).unwrap(), None, 0, false)
+        .unwrap();
+    assert_eq!(worker.snapshot.source_rate, 2_822_400);
+    assert_eq!(
+        worker.snapshot.track.as_ref().unwrap().metadata.sample_rate,
+        2_822_400
+    );
+    assert_eq!(worker.snapshot.output_rate, 384_000);
+    assert_eq!(
+        worker.output.as_ref().unwrap().sample_format,
+        cpal::SampleFormat::I32
+    );
+    assert!(worker.session.is_none(), "Resampler must be fully flushed");
+    assert_eq!(worker.written, 38_400 * 2);
+    assert_eq!(worker.segments.back().unwrap().end_sample, Some(38_400 * 2));
+    assert!(worker.snapshot.error.is_none());
+
+    worker.command(AudioCommand::Pause).unwrap();
+    worker
+        .command(AudioCommand::Seek {
+            position_ms: 50,
+            request_id: 19,
+        })
+        .unwrap();
+    assert_eq!(worker.snapshot.state, PlaybackState::Paused);
+    assert_eq!(worker.snapshot.position_ms, 50);
+    assert_eq!(worker.snapshot.seek_request_id, 19);
+    assert_eq!(worker.snapshot.source_rate, 2_822_400);
+    assert_eq!(worker.snapshot.output_rate, 384_000);
+    assert_eq!(
+        worker.output.as_ref().unwrap().sample_format,
+        cpal::SampleFormat::I32
+    );
+    assert!(worker.session.is_none(), "Seek tail must be fully flushed");
+    assert_eq!(worker.written, 19_200 * 2);
+    assert_eq!(worker.segments.back().unwrap().end_sample, Some(19_200 * 2));
+    assert!(worker.snapshot.error.is_none());
+    worker.command(AudioCommand::Resume).unwrap();
+    assert_eq!(worker.snapshot.state, PlaybackState::Playing);
+}
+
+#[test]
+fn mixed_dsd_pcm_policies_drain_and_reopen_even_with_identical_decoded_pcm() {
+    let samples = 2_822_400_u64 / 75;
+    let raw = [0xdf, 0x05].repeat(samples as usize / 8);
+    let dsd_file = dsd::tests::Fixture::new(
+        &dsd::tests::dsf(2_822_400, 2, samples, true, &raw, &[]),
+        "dsf",
+    );
+    let frames = dsd::PCM_RATE / 75;
+    let data_size = frames * 2 * 8;
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&3_u16.to_le_bytes());
+    wav.extend_from_slice(&2_u16.to_le_bytes());
+    wav.extend_from_slice(&dsd::PCM_RATE.to_le_bytes());
+    wav.extend_from_slice(&(dsd::PCM_RATE * 16).to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(&64_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_size.to_le_bytes());
+    for _ in 0..frames * 2 {
+        wav.extend_from_slice(&0.25_f64.to_le_bytes());
+    }
+    let pcm_file = dsd::tests::Fixture::new(&wav, "wav");
+
+    for dsd_first in [true, false] {
+        let mut prepared = Vec::new();
+        for (id, file, is_dsd) in [(1, &dsd_file, true), (2, &pcm_file, false)] {
+            let mut item = Prepared::open(Track {
+                id,
+                path: file.0.clone(),
+                metadata: TrackMetadata::default(),
+                missing: false,
+                segment: None,
+            })
+            .unwrap();
+            // Deliberately misleading labels must not change the backend's policy.
+            let codec = if is_dsd { "pcm" } else { "dsd" };
+            item.track.metadata.codec = codec.into();
+            item.decoder.metadata.codec = codec.into();
+            assert_eq!(item.decoder.is_dsd(), is_dsd);
+            assert_eq!(
+                item.rate_selection(),
+                if is_dsd {
+                    RateSelection::Highest
+                } else {
+                    RateSelection::Native
+                }
+            );
+            assert_eq!(item.decoder.pcm_spec().rate, 176_400);
+            assert_eq!(item.decoder.pcm_spec().channels, 2);
+            assert_eq!(item.decoder.pcm_format(), PcmFormat::Float(64));
+            prepared.push(item);
+        }
+        if !dsd_first {
+            prepared.reverse();
+        }
+        let second = prepared.pop().unwrap();
+        let first = prepared.pop().unwrap();
+        let first_policy = first.rate_selection();
+        let second_policy = second.rate_selection();
+        let second_id = second.track.id;
+        let (sender, _) = watch::channel(PlaybackSnapshot::default());
+        let mut worker = Worker::with_devices(
+            sender,
+            Arc::new(|| {}),
+            Arc::new(AtomicBool::new(false)),
+            Vec::new(),
+        );
+        worker.output_factory = Some(|rate, channels, format, policy, selected, volume| {
+            assert_eq!(rate, 176_400);
+            assert_eq!(format, PcmFormat::Float(64));
+            let target = match policy {
+                RateSelection::Native => rate,
+                RateSelection::Highest => 384_000,
+            };
+            recovery_output(target, channels, format, policy, selected, volume)
+        });
+        let next = second.track.clone();
+        worker.prepared = Some(second);
+        worker.load(first, Some(next), 0, false).unwrap();
+        let initial_rate = if dsd_first { 384_000 } else { 176_400 };
+        assert_eq!(worker.snapshot.output_rate, initial_rate);
+        assert_eq!(worker.segments.len(), 1);
+        assert_eq!(worker.segments[0].rate_selection, first_policy);
+        assert!(!worker.compatible(worker.prepared.as_ref().unwrap()));
+        assert!(
+            worker.session.is_none(),
+            "First track must be fully flushed"
+        );
+        assert_eq!(worker.snapshot.completed, 0);
+        let state = worker.output.as_ref().unwrap().state.clone();
+        state.consumed.store(worker.written, Ordering::Relaxed);
+        worker.tick().unwrap();
+        assert_eq!(worker.snapshot.completed, 1);
+        assert_eq!(worker.snapshot.track.as_ref().unwrap().id, second_id);
+        assert_eq!(
+            worker.snapshot.output_rate,
+            if dsd_first { 176_400 } else { 384_000 }
+        );
+        assert_eq!(worker.segments[0].rate_selection, second_policy);
+        assert!(!Arc::ptr_eq(&state, &worker.output.as_ref().unwrap().state));
+        assert!(worker.snapshot.error.is_none());
+    }
 }
 
 #[test]
@@ -537,6 +968,7 @@ fn recovery_output(
     rate: u32,
     channels: usize,
     _format: PcmFormat,
+    _rate_selection: RateSelection,
     selected: Option<&str>,
     volume: f32,
 ) -> Result<Output> {
@@ -551,10 +983,11 @@ fn precision_output(
     rate: u32,
     channels: usize,
     format: PcmFormat,
+    rate_selection: RateSelection,
     selected: Option<&str>,
     volume: f32,
 ) -> Result<Output> {
-    let mut output = recovery_output(rate, channels, format, selected, volume)?;
+    let mut output = recovery_output(rate, channels, format, rate_selection, selected, volume)?;
     output.sample_format = cpal::SampleFormat::I32;
     Ok(output)
 }
@@ -606,8 +1039,9 @@ fn precision_reducing_output_falls_back_without_stopping_playback() {
         Arc::new(AtomicBool::new(false)),
         Vec::new(),
     );
-    worker.output_factory = Some(|rate, channels, format, selected, volume| {
-        let mut output = recovery_output(rate, channels, format, selected, volume)?;
+    worker.output_factory = Some(|rate, channels, format, rate_selection, selected, volume| {
+        assert_eq!(rate_selection, RateSelection::Native);
+        let mut output = recovery_output(rate, channels, format, rate_selection, selected, volume)?;
         output.sample_format = cpal::SampleFormat::F32;
         Ok(output)
     });
@@ -625,28 +1059,33 @@ fn precision_reducing_output_falls_back_without_stopping_playback() {
     assert!(worker.snapshot.error.is_none());
 }
 
-fn recovery_devices() -> Vec<String> {
-    vec!["Replacement output".into()]
+fn update_devices(worker: &mut Worker, devices: Vec<String>) {
+    let (sender, receiver) = watch::channel(devices);
+    drop(sender);
+    worker.device_updates = receiver;
+    worker.refresh_devices();
 }
 
 fn reject_missing_output(
     rate: u32,
     channels: usize,
     format: PcmFormat,
+    rate_selection: RateSelection,
     selected: Option<&str>,
     volume: f32,
 ) -> Result<Output> {
+    assert_eq!(rate_selection, RateSelection::Native);
     if selected == Some("Missing output") {
         bail!("Selected output device is unavailable");
     }
-    recovery_output(rate, channels, format, selected, volume)
+    recovery_output(rate, channels, format, rate_selection, selected, volume)
 }
 
 #[test]
 fn failed_initial_output_selection_can_be_changed_and_retried() {
     let (_fixture, track) = fixture(1, 8192);
     let (mut worker, _consumer, _callback) = worker(track.clone(), None);
-    worker.enumerate_devices = recovery_devices;
+    update_devices(&mut worker, vec!["Replacement output".into()]);
     worker.output_factory = Some(reject_missing_output);
     worker
         .command(AudioCommand::Stop { generation: 8 })
@@ -684,7 +1123,7 @@ fn selecting_replacement_output_preserves_disconnected_track_position_and_queue(
     let (_a, a) = fixture(1, 8192);
     let (_b, b) = fixture(2, -16384);
     let (mut worker, _consumer, callback) = worker(a, Some(b));
-    worker.enumerate_devices = recovery_devices;
+    update_devices(&mut worker, vec!["Replacement output".into()]);
     worker.output_factory = Some(recovery_output);
     callback.consumed.store(800, Ordering::Relaxed);
     callback.failed.store(true, Ordering::Relaxed);
@@ -722,7 +1161,7 @@ fn selecting_replacement_output_preserves_disconnected_track_position_and_queue(
 fn default_output_recovery_preserves_pause_state_and_idle_selection_clears_error() {
     let (_fixture, track) = fixture(1, 8192);
     let (mut worker, _consumer, callback) = worker(track, None);
-    worker.enumerate_devices = recovery_devices;
+    update_devices(&mut worker, vec!["Replacement output".into()]);
     worker.output_factory = Some(recovery_output);
     worker.selected_device = Some("Headphones".into());
     worker.snapshot.selected_device = worker.selected_device.clone();
@@ -765,7 +1204,7 @@ fn reselecting_current_output_keeps_the_stream_and_position() {
     for selected in [None, Some("Headphones".to_string())] {
         let (_fixture, track) = fixture(1, 8192);
         let (mut worker, _consumer, callback) = worker(track, None);
-        worker.enumerate_devices = recovery_devices;
+        update_devices(&mut worker, vec!["Replacement output".into()]);
         worker.selected_device = selected.clone();
         worker.snapshot.selected_device = selected.clone();
         callback.consumed.store(800, Ordering::Relaxed);
@@ -787,7 +1226,7 @@ fn reselecting_disconnected_output_preserves_position_until_play_resumes() {
         let (_a, a) = fixture(1, 8192);
         let (_b, b) = fixture(2, -16384);
         let (mut worker, _consumer, callback) = worker(a, Some(b));
-        worker.enumerate_devices = recovery_devices;
+        update_devices(&mut worker, vec!["Replacement output".into()]);
         worker.output_factory = Some(recovery_output);
         worker.selected_device = selected.clone();
         worker.snapshot.selected_device = selected.clone();
@@ -834,7 +1273,7 @@ fn cue_tracks_keep_logical_metadata_and_recover_relative_position() {
     assert_eq!(prepared.track.metadata.artist, "CUE artist");
     assert_eq!(prepared.track.metadata.duration_ms, 200);
     let (mut worker, _consumer, callback) = worker(track, None);
-    worker.enumerate_devices = recovery_devices;
+    update_devices(&mut worker, vec!["Replacement output".into()]);
     worker.output_factory = Some(recovery_output);
     callback.consumed.store(400, Ordering::Relaxed);
     worker.command(AudioCommand::Pause).unwrap();

@@ -104,20 +104,9 @@ impl RubatoResampler {
 }
 
 impl Converter {
-    pub fn new(
-        input_rate: u32,
-        output_rate: u32,
-        input_channels: usize,
-        output_channels: usize,
-    ) -> Result<Self> {
+    pub(crate) fn validate_rates(input_rate: u32, output_rate: u32) -> Result<()> {
         if input_rate == 0 || output_rate == 0 || input_rate > 768_000 || output_rate > 768_000 {
             bail!("Unsupported sample rate (must be 1..=768000 Hz)");
-        }
-        if !(input_channels == output_channels || (input_channels == 1 && output_channels == 2))
-            || !(1..=2).contains(&input_channels)
-            || !(1..=2).contains(&output_channels)
-        {
-            bail!("Only mono and stereo playback is supported");
         }
         // Rubato allocates its FFT and scratch storage in the constructor. Bound the
         // GCD-derived FFT sizes before calling it, including unusual coprime rates.
@@ -134,6 +123,22 @@ impl Converter {
             || subchunks.saturating_mul(minimum_output) > 65_536
         {
             bail!("Unsupported conversion ratio or FFT size; choose a closer output rate");
+        }
+        Ok(())
+    }
+
+    pub fn new(
+        input_rate: u32,
+        output_rate: u32,
+        input_channels: usize,
+        output_channels: usize,
+    ) -> Result<Self> {
+        Self::validate_rates(input_rate, output_rate)?;
+        if !(input_channels == output_channels || (input_channels == 1 && output_channels == 2))
+            || !(1..=2).contains(&input_channels)
+            || !(1..=2).contains(&output_channels)
+        {
+            bail!("Only mono and stereo playback is supported");
         }
         let resampler = if input_rate != output_rate {
             Some(RubatoResampler::new(

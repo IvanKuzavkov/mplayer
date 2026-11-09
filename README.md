@@ -53,6 +53,10 @@ device selection. Volume, output preference, folders, tracks, and playlists
 survive a restart; the application starts stopped and the queue is session-only.
 The output selector stays visible above the now-playing panel. Choosing another
 device after output failure retries the retained track at its previous position.
+Output-device discovery runs immediately in the background, then three seconds
+after each completed scan. Blocking native enumeration stays off the playback
+worker and Tokio executor threads; scans never overlap. The device list may be
+briefly empty at startup while the first scan completes.
 The now-playing panel shows embedded PNG/JPEG front-cover artwork, with a record
 placeholder for tracks without a supported image. Covers decode in the background
 and are resized for display; rapidly skipping tracks does not show stale covers.
@@ -75,9 +79,10 @@ on every scan, even when the audio file is unchanged. Seeking and output recover
 use positions relative to the selected logical track.
 
 DSF (`.dsf`) and DSDIFF (`.dff`) support DSD64, DSD128, and DSD256, including
-DST-compressed DFF. DSD is filtered and converted to 176.4 kHz PCM before normal
-output negotiation and resampling. Volume, seeking, queue playback, and embedded
-artwork work through the existing controls; the format display retains the source
+DST-compressed DFF. DSD is filtered to 176.4 kHz PCM internally, then resampled
+to the device's automatically selected output rate. Volume, seeking, queue
+playback, and embedded artwork work through the existing controls; the format
+display retains the source
 DSD rate and 1-bit depth. DFF files appear as one track, with external CUE sheets
 available for track boundaries. SACD ISO, DoP/native DSD output, DSD512, and
 multichannel DSD are not supported.
@@ -97,13 +102,25 @@ compensate filter delay and preserve timing across reads and seeks.
 See the [DSD filter design and mathematics](docs/FILTER.md) for
 the design history, equations, lookup-table derivation, and timing rules.
 
-The player requests the decoded PCM rate where the device supports it. If the
-native-rate stream cannot be opened, it uses the default output configuration and
-Rubato resampling. The UI shows source and configured output rates. OS mixing can
+For ordinary PCM tracks, the player requests the source's native rate. For DSD,
+it automatically tries the device's highest advertised compatible PCM rate first,
+within the converter's 768 kHz limit. At each rate it retains the existing
+precision and channel-layout preferences; it does not force 16-bit output. If a
+candidate cannot be opened, other advertised candidates are tried before falling
+back to the default output configuration. Rubato resampling is used when needed.
+No output-rate environment override is required. The UI and signal-path log show
+the source and actual output rates. Switching between PCM and DSD renegotiates the
+output rather than reusing a stream with the other rate policy. OS mixing can
 still change the hardware signal; this is shared output, not an exclusive or
 bit-perfect hardware mode. The playback pipeline uses `f64` samples and chooses
 output formats that preserve decoded PCM precision where possible. DSD-to-PCM
 conversion does not preserve the original DSD bitstream.
+
+On Linux, output requests a 20 ms device period within the advertised limits,
+with a retry using the device default if that request is rejected. ALSA normally
+buffers about two periods. This trades some output latency for scheduling
+headroom without changing the decoded samples; actual negotiated sizes are
+recorded in the output-open log.
 
 Compatible consecutive tracks are decoded ahead into the same bounded output
 buffer. Decoder delay/padding is trimmed where supported. Changing source rates
@@ -163,7 +180,11 @@ Spans cover application tasks, database operations, scanning, source opening,
 playback commands, seeking and device setup. Async tasks and blocking workers
 inherit operation context. Span-close records include elapsed busy/idle time.
 Audio callbacks perform no tracing; the worker reports aggregated underruns.
-Paths and track identifiers may appear in diagnostic logs.
+While playing, the worker also logs diagnostics every five seconds: track
+position, current and minimum callback-observed PCM queue depth, maximum callback
+interval, and separate application-buffer and device-underrun counters. A zero
+underrun count does not prove successful hardware delivery; backend and downstream
+losses may not be reported. Paths and track identifiers may appear in diagnostic logs.
 
 ## Development and validation
 
@@ -182,3 +203,22 @@ packages or encoder executables required). Manual performance tests run with:
 cargo test --release --locked -p mplayer-audio -- --ignored --nocapture
 cargo test --release --locked -p mplayer-core -- --ignored --nocapture
 ```
+
+Offline DSD correctness checks can compare local passages against an independently
+decoded FFmpeg reference. This optional diagnostic uses existing Python NumPy,
+`ffmpeg`, and `ffprobe` installations; it installs nothing and does not open an
+audio device:
+
+```sh
+python3 mplayer-audio/tests/compare_dsd.py "/path/to/track.dsf" --positions 110 121
+python3 mplayer-audio/tests/compare_dsd.py --self-test
+```
+
+The diagnostic checks sample-exact agreement between continuous, seeked, and
+sequential-filter decoding, and verifies playback-queue delivery through an i32
+callback using simulated 883- and 3528-frame periods. It then compares ten-second
+windows with FFmpeg using a common audible-band analysis filter and one fitted
+delay/gain per window. Different DSD filters need not be bit-identical: the report
+shows global and local 10 ms discrepancies rather than asserting exact agreement.
+Artifacts and `report.json` stay under `target/diagnostics/dsd/` by default. The
+self-test verifies that the comparison detects an injected 5 ms silence gap.

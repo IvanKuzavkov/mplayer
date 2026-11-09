@@ -179,6 +179,159 @@ fn stages_match_equivalent_fir_and_parallel_matches_sequential() {
     }
 }
 
+// Use absolute source-bit coordinates, not the decoder's padded byte window or
+// any staged/packed filtering, so window offsets and EOF masks are under test.
+fn streaming_reference(
+    taps: &[f64],
+    source: &[u8],
+    samples: usize,
+    channels: usize,
+    factor: usize,
+    frame: usize,
+    channel: usize,
+) -> f64 {
+    let first = (frame * factor) as i128 - (taps.len() / 2) as i128;
+    taps.iter()
+        .enumerate()
+        .map(|(index, tap)| {
+            let bit = first + index as i128;
+            let positive = if (0..samples as i128).contains(&bit) {
+                let bit = bit as usize;
+                source[bit / 8 * channels + channel] & (0x80 >> (bit % 8)) != 0
+            } else {
+                // MSB-first 0x55 silence, including negative source positions.
+                bit.rem_euclid(2) == 1
+            };
+            tap * if positive { 1.0 } else { -1.0 }
+        })
+        .sum()
+}
+
+#[test]
+fn dsf_streaming_boundaries_match_direct_fir() {
+    use crate::dsd::{
+        DsdDecoder,
+        tests::{Fixture, dsf},
+    };
+
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(2)
+        .stack_size(WORKER_STACK_BYTES)
+        .build()
+        .unwrap();
+    const FRAMES: usize = 3 * 4096 + 37;
+    for rate in [2_822_400, 5_644_800, 11_289_600] {
+        let factor = (rate / PCM_RATE) as usize;
+        let taps = equivalent(rate);
+        // Both a partial final PCM block and a partial final source byte. The
+        // last PCM center has only five real source bits before EOF padding.
+        let samples = (FRAMES - 1) * factor + 5;
+        let mut edges = vec![0, FRAMES - 1];
+        edges.extend((4096..FRAMES).step_by(4096));
+        edges.extend((2048..FRAMES).step_by(4096));
+        // DSF channel blocks are 4096 source bytes, not 4096 PCM frames.
+        edges.extend((4096 * 8 / factor..FRAMES).step_by(4096 * 8 / factor));
+        let mut positions: Vec<_> = edges
+            .into_iter()
+            .flat_map(|edge| edge.saturating_sub(2)..=(edge + 2).min(FRAMES - 1))
+            .collect();
+        positions.sort_unstable();
+        positions.dedup();
+
+        for channels in [1, 2] {
+            // High LCG bits avoid repeating a short pattern at either kind of
+            // block boundary; interleaved channels receive different bytes.
+            let mut state = 0x0123_4567_89ab_cdef_u64;
+            let mut source: Vec<_> = (0..samples.div_ceil(8) * channels)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    (state >> 32) as u8
+                })
+                .collect();
+            let length = source.len();
+            for byte in &mut source[length - channels..] {
+                // Deliberately disagree with 0x55 in every unused bit.
+                *byte = (*byte & 0xf8) | (0xaa & 0x07);
+            }
+            let expected: Vec<_> = positions
+                .iter()
+                .map(|&frame| {
+                    (0..channels)
+                        .map(|channel| {
+                            streaming_reference(
+                                &taps, &source, samples, channels, factor, frame, channel,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            for lsb in [false, true] {
+                let file = Fixture::new(
+                    &dsf(rate, channels, samples as u64, lsb, &source, &[]),
+                    "dsf",
+                );
+                for mode in ["default", "sequential", "two-worker"] {
+                    let mut decoder = DsdDecoder::open(&file.0).unwrap();
+                    let mut output = Vec::new();
+                    let mut start = 0;
+                    let mut checked = 0;
+                    loop {
+                        let more = match mode {
+                            "default" => decoder.next(&mut output),
+                            "sequential" => {
+                                decoder.next_with(&mut output, Filter::process_sequential)
+                            }
+                            _ => decoder.next_with(
+                                &mut output,
+                                |filter, bytes, channels, out, scratch| {
+                                    filter.process_with_pool(
+                                        bytes,
+                                        channels,
+                                        out,
+                                        scratch,
+                                        Some(&pool),
+                                    );
+                                },
+                            ),
+                        }
+                        .unwrap();
+                        let context = format!(
+                            "rate={rate}, channels={channels}, lsb={lsb}, mode={mode}, start={start}"
+                        );
+                        if !more {
+                            assert!(output.is_empty(), "{context}");
+                            break;
+                        }
+                        let frames = (FRAMES - start).min(4096);
+                        assert_eq!(output.len(), frames * channels, "{context}");
+                        assert!(output.iter().all(|value| value.is_finite()), "{context}");
+                        for (index, &frame) in positions.iter().enumerate() {
+                            if (start..start + frames).contains(&frame) {
+                                for channel in 0..channels {
+                                    let actual = output[(frame - start) * channels + channel];
+                                    let reference = expected[index][channel];
+                                    assert!(
+                                        (actual - reference).abs() < 1e-12,
+                                        "{context}, frame={frame}, channel={channel}, actual={actual}, reference={reference}"
+                                    );
+                                }
+                                checked += 1;
+                            }
+                        }
+                        start += frames;
+                    }
+                    assert_eq!(start, FRAMES);
+                    assert_eq!(checked, positions.len());
+                    // EOF stays terminal and clears a caller's stale samples.
+                    output.push(f64::NAN);
+                    assert!(!decoder.next(&mut output).unwrap());
+                    assert!(output.is_empty());
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn zero_tap_elision_and_shared_kernel_storage_are_valid() {
     let first = coefficients(128, 1.0 / 16.0);

@@ -706,7 +706,9 @@ fn decode_path(bytes: Vec<u8>) -> Result<PathBuf> {
         bail!("invalid stored Windows path");
     }
     let words = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect::<Vec<_>>();
     Ok(std::ffi::OsString::from_wide(&words).into())

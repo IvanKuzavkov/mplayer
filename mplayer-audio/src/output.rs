@@ -4,7 +4,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use crate::pcm::PcmFormat;
+use crate::{dsp::Converter, pcm::PcmFormat};
 use cpal::{
     FromSample, SampleFormat, SizedSample, StreamConfig, SupportedStreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -19,6 +19,8 @@ pub(crate) struct CallbackState {
     pub device_underruns: AtomicU64,
     pub callbacks: AtomicU64,
     pub max_callback_gap_ns: AtomicU64,
+    pub max_callback_interval_ns: AtomicU64,
+    pub min_queued_samples: AtomicU64,
     pub failed: AtomicBool,
     pub ending: AtomicBool,
     pub latency_ns: AtomicU64,
@@ -38,6 +40,8 @@ impl CallbackState {
     }
 
     fn callback_gap(&self, elapsed: Duration, expected: Duration) {
+        self.max_callback_interval_ns
+            .fetch_max(elapsed.as_nanos() as u64, Ordering::Relaxed);
         // Ignore ordinary scheduling jitter; retain only a clearly missed buffer.
         if elapsed > expected * 2 + Duration::from_millis(2) {
             self.max_callback_gap_ns
@@ -89,12 +93,89 @@ fn supported_sample_format(format: SampleFormat) -> bool {
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RateSelection {
+    Native,
+    Highest,
+}
+
+fn matches_output_config(
+    config: &cpal::SupportedStreamConfigRange,
+    rate: u32,
+    source_channels: usize,
+) -> bool {
+    let channels = usize::from(config.channels());
+    rate > 0
+        && (channels == source_channels || (source_channels == 1 && channels == 2))
+        && config.min_sample_rate() <= rate
+        && config.max_sample_rate() >= rate
+        && supported_sample_format(config.sample_format())
+}
+
+fn output_configs(
+    configs: impl IntoIterator<Item = cpal::SupportedStreamConfigRange>,
+    source_rate: u32,
+    source_channels: usize,
+    source_format: PcmFormat,
+    selection: RateSelection,
+) -> Vec<SupportedStreamConfig> {
+    let target_rate = |config: &cpal::SupportedStreamConfigRange| match selection {
+        RateSelection::Native => source_rate,
+        // Match the playback converter's maximum supported rate.
+        RateSelection::Highest => config.max_sample_rate().min(768_000),
+    };
+    let configs: Vec<_> = configs
+        .into_iter()
+        .filter(|config| matches_output_config(config, target_rate(config), source_channels))
+        .collect();
+    let mut rates: Vec<_> = configs.iter().map(target_rate).collect();
+    rates.sort_unstable();
+    rates.dedup();
+    let mut candidates = Vec::new();
+    for rate in rates {
+        if Converter::validate_rates(source_rate, rate).is_err() {
+            continue;
+        }
+        // A lower-rate retry must reconsider every format supporting that rate,
+        // not just formats whose advertised maximum happens to equal it.
+        candidates.extend(
+            configs
+                .iter()
+                .filter(|config| matches_output_config(config, rate, source_channels))
+                .map(|config| config.with_sample_rate(rate)),
+        );
+    }
+    candidates.sort_by_key(|config| {
+        (
+            std::cmp::Reverse(config.sample_rate()),
+            usize::from(config.channels()) != source_channels
+                || !source_format.preserved_by(config.sample_format()),
+            usize::from(config.channels()) != source_channels,
+            source_format.preference(config.sample_format()),
+        )
+    });
+    candidates
+}
+
+fn playback_buffer_size(rate: u32, supported: &cpal::SupportedBufferSize) -> cpal::BufferSize {
+    match *supported {
+        cpal::SupportedBufferSize::Range { min, max } if max > 0 && min <= max => {
+            // Music playback does not need a low-latency monitoring period.
+            // ALSA uses about two periods; 20 ms leaves more scheduling headroom
+            // than the native device's commonly selected 5 ms default.
+            cpal::BufferSize::Fixed(rate.div_ceil(50).clamp(min.max(1), max))
+        }
+        _ => cpal::BufferSize::Default,
+    }
+}
+
 impl Output {
-    #[tracing::instrument(skip_all, fields(source_rate, source_channels, selected))]
+    #[tracing::instrument(skip_all, fields(source_rate, source_channels, ?rate_selection, selected))]
     pub fn open(
         source_rate: u32,
         source_channels: usize,
         source_format: PcmFormat,
+        rate_selection: RateSelection,
         selected: Option<&str>,
         volume: f32,
     ) -> Result<Self> {
@@ -109,31 +190,24 @@ impl Output {
             host.default_output_device()
                 .ok_or(anyhow::anyhow!("No output device is available"))?
         };
-        let default = device.default_output_config()?;
-        let mut native = device
-            .supported_output_configs()?
-            .filter(|config| {
-                let channels = usize::from(config.channels());
-                (channels == source_channels || (source_channels == 1 && channels == 2))
-                    && config.min_sample_rate() <= source_rate
-                    && config.max_sample_rate() >= source_rate
-                    && supported_sample_format(config.sample_format())
-            })
-            .collect::<Vec<_>>();
-        native.sort_by_key(|config| {
-            (
-                usize::from(config.channels()) != source_channels
-                    || !source_format.preserved_by(config.sample_format()),
-                usize::from(config.channels()) != source_channels,
-                source_format.preference(config.sample_format()),
-            )
-        });
-        for config in native {
-            match Self::build(&device, config.with_sample_rate(source_rate), volume) {
+        let candidates = output_configs(
+            device.supported_output_configs()?,
+            source_rate,
+            source_channels,
+            source_format,
+            rate_selection,
+        );
+        for config in candidates {
+            let requested_rate = config.sample_rate();
+            match Self::build(&device, config, volume) {
                 Ok(output) => return Ok(output),
-                Err(error) => tracing::debug!(%error, "Native-rate output configuration rejected"),
+                Err(error) => {
+                    tracing::debug!(%error, requested_rate, "Requested-rate output configuration rejected");
+                }
             }
         }
+        let default = device.default_output_config()?;
+        Converter::validate_rates(source_rate, default.sample_rate())?;
         let channels = usize::from(default.channels());
         if channels > 2 || channels == 0 || (source_channels == 2 && channels == 1) {
             anyhow::bail!("Output device has no supported mono/stereo configuration");
@@ -147,16 +221,45 @@ impl Output {
     }
 
     fn build(device: &cpal::Device, supported: SupportedStreamConfig, volume: f32) -> Result<Self> {
-        let rate = supported.sample_rate();
-        let channels = usize::from(supported.channels());
+        let config = supported.config();
         let sample_format = supported.sample_format();
+        let buffer_size = playback_buffer_size(config.sample_rate, supported.buffer_size());
+        if buffer_size != cpal::BufferSize::Default {
+            match Self::build_config(
+                device,
+                StreamConfig {
+                    buffer_size,
+                    ..config
+                },
+                sample_format,
+                volume,
+            ) {
+                Ok(output) => return Ok(output),
+                Err(error) => tracing::warn!(
+                    %error,
+                    ?buffer_size,
+                    "Playback buffer request rejected; retrying device default"
+                ),
+            }
+        }
+        Self::build_config(device, config, sample_format, volume)
+    }
+
+    fn build_config(
+        device: &cpal::Device,
+        config: StreamConfig,
+        sample_format: SampleFormat,
+        volume: f32,
+    ) -> Result<Self> {
+        let rate = config.sample_rate;
+        let channels = usize::from(config.channels);
         let capacity = (rate as usize / 2).max(4096) * channels;
         let (producer, consumer) = HeapRb::<f64>::new(capacity).split();
         let state = Arc::new(CallbackState::default());
         state.paused.store(true, Ordering::Relaxed);
         state.volume.store(volume.to_bits(), Ordering::Relaxed);
-        let config = supported.config();
-        let (stream, errors) = match supported.sample_format() {
+        state.min_queued_samples.store(u64::MAX, Ordering::Relaxed);
+        let (stream, errors) = match sample_format {
             SampleFormat::F32 => build_stream::<f32>(device, config, consumer, state.clone()),
             SampleFormat::F64 => build_stream::<f64>(device, config, consumer, state.clone()),
             SampleFormat::I8 => build_stream::<i8>(device, config, consumer, state.clone()),
@@ -170,8 +273,18 @@ impl Output {
             SampleFormat::U64 => build_stream::<u64>(device, config, consumer, state.clone()),
             format => anyhow::bail!(format!("Unsupported output sample format: {format}")),
         }?;
+        let period_frames = stream.buffer_size().ok();
         stream.play()?;
-        tracing::info!(rate, channels, %sample_format, device = %device, "Opened audio output");
+        tracing::info!(
+            rate,
+            channels,
+            %sample_format,
+            device = %device,
+            requested_buffer = ?config.buffer_size,
+            period_frames,
+            period_ms = period_frames.map(|frames| f64::from(frames) * 1000.0 / f64::from(rate)),
+            "Opened audio output"
+        );
         Ok(Self {
             _stream: Some(stream),
             producer,
@@ -224,6 +337,7 @@ impl Output {
         let (_, errors) = HeapRb::new(16).split();
         let state = Arc::new(CallbackState::default());
         state.volume.store(1.0_f32.to_bits(), Ordering::Relaxed);
+        state.min_queued_samples.store(u64::MAX, Ordering::Relaxed);
         (
             Self {
                 _stream: None,
@@ -305,7 +419,11 @@ fn render<T: SizedSample + FromSample<f64>>(
         output.fill(T::from_sample(0.0));
         return;
     }
-    let available = consumer.occupied_len().min(output.len()) / channels * channels;
+    let queued = consumer.occupied_len();
+    state
+        .min_queued_samples
+        .fetch_min(queued as u64, Ordering::Relaxed);
+    let available = queued.min(output.len()) / channels * channels;
     let volume = f64::from(f32::from_bits(state.volume.load(Ordering::Relaxed)));
     let float_output = T::FORMAT.is_float();
     let maximum = if float_output {

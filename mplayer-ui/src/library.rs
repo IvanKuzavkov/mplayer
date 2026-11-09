@@ -123,6 +123,7 @@ impl PlayerApp {
     }
 
     pub(super) fn library(&mut self, ui: &mut egui::Ui, state: &AppSnapshot) {
+        let mut skip_pagination = false;
         ui.horizontal(|ui| {
             for (tab, label) in [
                 (LibraryTab::Tracks, "Tracks"),
@@ -236,19 +237,30 @@ impl PlayerApp {
                 egui::Layout::top_down(egui::Align::Center),
                 |ui| {
                     ui.add_space((height * 0.2).max(12.0));
-                    ui.label(
-                        RichText::new(if self.search.is_empty() {
-                            "Your music starts here"
-                        } else {
-                            "No matching music"
-                        })
-                        .size(22.0)
-                        .strong(),
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(if self.search.is_empty() {
+                                "Your music starts here"
+                            } else {
+                                "No matching music"
+                            })
+                            .size(22.0)
+                            .strong(),
+                        )
+                        .selectable(false)
+                        .show_tooltip_when_elided(false),
                     );
-                    ui.label(
-                        RichText::new("Choose a music folder or drop audio files into the window.")
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Choose a music folder or drop audio files into the window.",
+                            )
                             .color(ui.visuals().weak_text_color()),
+                        )
+                        .selectable(false)
+                        .show_tooltip_when_elided(false),
                     );
+                    skip_pagination = true;
                     ui.add_space(12.0);
                     if ui.button("Add music folders…").clicked() {
                         self.view = View::ScanFolders;
@@ -400,31 +412,33 @@ impl PlayerApp {
             let _ = output;
         }
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(offset > 0, egui::Button::new("‹ Previous"))
-                .clicked()
-            {
-                self.library_page(offset.saturating_sub(PAGE_SIZE));
-            }
-            let end = (offset + count as u64).min(total);
-            ui.label(
-                RichText::new(format!(
-                    "{}–{} / {}",
-                    if total == 0 { 0 } else { offset + 1 },
-                    end,
-                    total
-                ))
-                .small()
-                .color(ui.visuals().weak_text_color()),
-            );
-            if ui
-                .add_enabled(end < total, egui::Button::new("Next ›"))
-                .clicked()
-            {
-                self.library_page(offset + PAGE_SIZE);
-            }
-        });
+        if !skip_pagination {
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(offset > 0, egui::Button::new("‹ Previous"))
+                    .clicked()
+                {
+                    self.library_page(offset.saturating_sub(PAGE_SIZE));
+                }
+                let end = (offset + count as u64).min(total);
+                ui.label(
+                    RichText::new(format!(
+                        "{}–{} / {}",
+                        if total == 0 { 0 } else { offset + 1 },
+                        end,
+                        total
+                    ))
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                );
+                if ui
+                    .add_enabled(end < total, egui::Button::new("Next ›"))
+                    .clicked()
+                {
+                    self.library_page(offset + PAGE_SIZE);
+                }
+            });
+        }
     }
     pub(super) fn track_row(
         &mut self,

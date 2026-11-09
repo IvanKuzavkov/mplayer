@@ -250,6 +250,10 @@ impl Decoder {
         Ok(Self { backend, metadata })
     }
 
+    pub fn is_dsd(&self) -> bool {
+        matches!(&self.backend, Backend::Dsd(_))
+    }
+
     pub fn pcm_spec(&self) -> PcmSpec {
         match &self.backend {
             Backend::Symphonia(decoder) => PcmSpec {

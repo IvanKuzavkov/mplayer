@@ -157,31 +157,35 @@ impl PlayerApp {
                 self.output_button = Some(audio_output_button.rect);
             }
             egui::Popup::menu(&audio_output_button).show(|ui| {
-                ui.label(
-                    RichText::new("Output device")
-                        .small()
-                        .color(ui.visuals().weak_text_color()),
-                );
-                if ui
-                    .selectable_label(playback.selected_device.is_none(), "System default")
-                    .clicked()
-                {
-                    self.submit(AppCommand::SetDevice(None));
-                    ui.close();
-                }
-                for device in &playback.devices {
-                    if ui
-                        .selectable_label(
-                            playback.selected_device.as_ref() == Some(device),
-                            device_name(device),
-                        )
-                        .on_hover_text(device)
-                        .clicked()
-                    {
-                        self.submit(AppCommand::SetDevice(Some(device.clone())));
-                        ui.close();
-                    }
-                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("Output device")
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                        if ui
+                            .selectable_label(playback.selected_device.is_none(), "System default")
+                            .clicked()
+                        {
+                            self.submit(AppCommand::SetDevice(None));
+                            ui.close();
+                        }
+                        for device in &playback.devices {
+                            if ui
+                                .selectable_label(
+                                    playback.selected_device.as_ref() == Some(device),
+                                    device_name(device),
+                                )
+                                .on_hover_text(device)
+                                .clicked()
+                            {
+                                self.submit(AppCommand::SetDevice(Some(device.clone())));
+                                ui.close();
+                            }
+                        }
+                    })
             });
         });
         ui.add_space(16.0);

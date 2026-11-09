@@ -556,6 +556,107 @@ fn metadata_artwork_and_invalid_tags_do_not_change_audio() {
 }
 
 #[test]
+#[ignore = "manual real-file PCM correctness/export; set MPLAYER_DSD_CHECK_FILE and MPLAYER_DSD_CHECK_DIR"]
+fn dsd_file_correctness_windows() {
+    use std::io::Write;
+
+    let Some(file) = std::env::var_os("MPLAYER_DSD_CHECK_FILE") else {
+        eprintln!(
+            "Set MPLAYER_DSD_CHECK_FILE and MPLAYER_DSD_CHECK_DIR for offline PCM comparison"
+        );
+        return;
+    };
+    let directory = PathBuf::from(
+        std::env::var_os("MPLAYER_DSD_CHECK_DIR").expect("set MPLAYER_DSD_CHECK_DIR"),
+    );
+    assert!(
+        directory.is_dir(),
+        "Create the diagnostic output directory first"
+    );
+    let starts: Vec<u64> = std::env::var("MPLAYER_DSD_CHECK_STARTS")
+        .unwrap_or_else(|_| "105,116".into())
+        .split(',')
+        .map(|value| value.parse().expect("invalid window start"))
+        .collect();
+    let seconds: u64 = std::env::var("MPLAYER_DSD_CHECK_SECONDS")
+        .map_or(10, |value| value.parse().expect("invalid window length"));
+    assert!(!starts.is_empty() && seconds > 0 && seconds <= 60);
+    let frames = (seconds * u64::from(PCM_RATE)) as usize;
+    let mut decoder = DsdDecoder::open(Path::new(&file)).unwrap();
+    let channels = decoder.reader.channels;
+    let end = (starts.iter().max().unwrap() + seconds) * u64::from(PCM_RATE);
+    assert!(end <= decoder.end, "Requested windows extend beyond EOF");
+    let mut windows: Vec<Vec<f64>> = starts.iter().map(|_| Vec::new()).collect();
+    let mut output = Vec::new();
+    let mut position = 0;
+    while position < end {
+        assert!(decoder.next(&mut output).unwrap());
+        assert!(output.iter().all(|sample| sample.is_finite()));
+        let next = position + (output.len() / channels) as u64;
+        for (&start, window) in starts.iter().zip(&mut windows) {
+            let start = start * u64::from(PCM_RATE);
+            let first = position.max(start);
+            let last = next.min(start + frames as u64);
+            if first < last {
+                window.extend_from_slice(
+                    &output[(first - position) as usize * channels
+                        ..(last - position) as usize * channels],
+                );
+            }
+        }
+        position = next;
+    }
+    for (&start, continuous) in starts.iter().zip(windows) {
+        assert_eq!(continuous.len(), frames * channels);
+        for sequential in [false, true] {
+            let mut decoder = DsdDecoder::open(Path::new(&file)).unwrap();
+            decoder.seek(start * 1000).unwrap();
+            let mut checked = 0;
+            while checked < continuous.len() {
+                let more = if sequential {
+                    decoder.next_with(&mut output, Filter::process_sequential)
+                } else {
+                    decoder.next(&mut output)
+                };
+                assert!(more.unwrap());
+                let count = output.len().min(continuous.len() - checked);
+                if let Some(index) = output[..count]
+                    .iter()
+                    .zip(&continuous[checked..checked + count])
+                    .position(|(actual, expected)| actual.to_bits() != expected.to_bits())
+                {
+                    panic!(
+                        "PCM differs: start={start}s sequential={sequential} frame={} channel={} actual={} expected={}",
+                        (checked + index) / channels,
+                        (checked + index) % channels,
+                        output[index],
+                        continuous[checked + index]
+                    );
+                }
+                checked += count;
+            }
+            eprintln!(
+                "DSD_CORRECTNESS start={start}s seconds={seconds} channels={channels} sequential={sequential} matching_samples={checked}"
+            );
+        }
+        let destination = directory.join(format!("pcm-{start}.f64le"));
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(&destination).unwrap());
+        for samples in continuous.chunks(4096 * channels) {
+            let bytes: Vec<_> = samples
+                .iter()
+                .flat_map(|sample| sample.to_le_bytes())
+                .collect();
+            writer.write_all(&bytes).unwrap();
+        }
+        writer.flush().unwrap();
+        eprintln!(
+            "DSD_PCM_EXPORT rate={PCM_RATE} channels={channels} file={}",
+            destination.display()
+        );
+    }
+}
+
+#[test]
 #[ignore = "manual real-file DSD decode/resample timing; set MPLAYER_DSD_BENCH_FILE"]
 fn dsd_file_throughput() {
     use crate::dsp::Converter;
