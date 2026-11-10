@@ -32,7 +32,7 @@ impl PlayerApp {
         icon_buttons::playlist_icon(
             ui.painter(),
             egui::Rect::from_min_size(header.min, egui::vec2(64.0, 64.0)),
-            theme::accent(ui),
+            theme::accent(ui.visuals()),
         );
         let left = header.left() + 80.0;
         let mut text_ui = ui.new_child(egui::UiBuilder::new().max_rect(egui::Rect::from_min_max(
@@ -149,7 +149,7 @@ impl PlayerApp {
                                     ui.painter().hline(
                                         response.rect.x_range(),
                                         y,
-                                        egui::Stroke::new(2.0, theme::accent(ui)),
+                                        egui::Stroke::new(2.0, theme::accent(ui.visuals())),
                                     );
                                     if response.dnd_release_payload::<PlaylistDrag>().is_some() {
                                         self.submit(AppCommand::MovePlaylistEntry {

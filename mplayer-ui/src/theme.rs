@@ -1,81 +1,82 @@
 use eframe::egui::{self, Color32};
 
-pub const ACCENT: Color32 = Color32::from_rgb(221, 190, 83);
+pub const ACCENT_DARK: Color32 = Color32::from_rgb(221, 190, 83);
+pub const ACCENT_LIGHT: Color32 = Color32::from_rgb(125, 91, 0);
 
-pub fn accent(ui: &egui::Ui) -> Color32 {
-    if ui.visuals().dark_mode {
-        ACCENT
+pub fn accent(theme: &egui::Visuals) -> Color32 {
+    if theme.dark_mode {
+        ACCENT_DARK
     } else {
-        Color32::from_rgb(125, 91, 0)
+        ACCENT_LIGHT
+    }
+}
+
+enum UIThemes {
+    Dark(egui::style::Visuals),
+    Light(egui::style::Visuals),
+}
+
+impl UIThemes {
+    fn new_dark() -> Self {
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = Color32::from_rgb(30, 31, 35);
+        visuals.window_fill = visuals.panel_fill;
+        visuals.extreme_bg_color = Color32::from_rgb(19, 20, 23);
+        visuals.weak_text_color = Some(Color32::from_rgb(164, 166, 171));
+        visuals.selection.bg_fill = Color32::from_rgb(80, 69, 34);
+        visuals.selection.stroke = egui::Stroke::new(1.0, accent(&visuals));
+        visuals.widgets.noninteractive.bg_stroke =
+            egui::Stroke::new(1.0, Color32::from_rgb(53, 54, 60));
+        visuals.widgets.active.bg_fill = Color32::from_rgb(65, 57, 34);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(58, 59, 64);
+        visuals.faint_bg_color = Color32::from_rgb(37, 38, 42);
+        visuals.error_fg_color = Color32::LIGHT_RED;
+        UIThemes::Dark(visuals)
+    }
+
+    fn new_light() -> Self {
+        let mut visuals = egui::Visuals::light();
+        visuals.panel_fill = Color32::from_rgb(253, 252, 249);
+        visuals.window_fill = visuals.panel_fill;
+        visuals.extreme_bg_color = Color32::from_rgb(246, 245, 241);
+        visuals.weak_text_color = Some(Color32::from_rgb(92, 94, 99));
+        visuals.selection.bg_fill = Color32::from_rgb(244, 225, 166);
+        visuals.selection.stroke = egui::Stroke::new(1.0, accent(&visuals));
+        visuals.widgets.noninteractive.bg_stroke =
+            egui::Stroke::new(1.0, Color32::from_rgb(200, 199, 193));
+        visuals.widgets.active.bg_fill = Color32::from_rgb(235, 216, 157);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(234, 233, 228);
+        visuals.faint_bg_color = Color32::from_rgb(248, 247, 243);
+        visuals.error_fg_color = Color32::from_rgb(175, 30, 40);
+        UIThemes::Light(visuals)
+    }
+
+    pub fn from_egui_theme(theme: &egui::Theme) -> Self {
+        if theme == &egui::Theme::Dark {
+            Self::new_dark()
+        } else {
+            Self::new_light()
+        }
+    }
+
+    pub fn into_visuals(self) -> egui::style::Visuals {
+        match self {
+            UIThemes::Dark(visuals) => visuals,
+            UIThemes::Light(visuals) => visuals,
+        }
+    }
+}
+
+impl Into<egui::style::Visuals> for UIThemes {
+    fn into(self) -> egui::Visuals {
+        self.into_visuals()
     }
 }
 
 pub fn apply(context: &egui::Context) {
     for theme in [egui::Theme::Dark, egui::Theme::Light] {
-        let dark = theme == egui::Theme::Dark;
-        let mut visuals = if dark {
-            egui::Visuals::dark()
-        } else {
-            egui::Visuals::light()
-        };
-        visuals.panel_fill = if dark {
-            Color32::from_rgb(30, 31, 35)
-        } else {
-            Color32::from_rgb(253, 252, 249)
-        };
-        visuals.window_fill = visuals.panel_fill;
-        visuals.extreme_bg_color = if dark {
-            Color32::from_rgb(19, 20, 23)
-        } else {
-            Color32::from_rgb(246, 245, 241)
-        };
-        visuals.weak_text_color = Some(if dark {
-            Color32::from_rgb(164, 166, 171)
-        } else {
-            Color32::from_rgb(92, 94, 99)
-        });
-        visuals.selection.bg_fill = if dark {
-            Color32::from_rgb(80, 69, 34)
-        } else {
-            Color32::from_rgb(244, 225, 166)
-        };
-        visuals.selection.stroke = egui::Stroke::new(
-            1.0,
-            if dark {
-                ACCENT
-            } else {
-                Color32::from_rgb(125, 91, 0)
-            },
-        );
-        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(
-            1.0,
-            if dark {
-                Color32::from_rgb(53, 54, 60)
-            } else {
-                Color32::from_rgb(200, 199, 193)
-            },
-        );
-        visuals.widgets.active.bg_fill = if dark {
-            Color32::from_rgb(65, 57, 34)
-        } else {
-            Color32::from_rgb(235, 216, 157)
-        };
-        visuals.widgets.hovered.bg_fill = if dark {
-            Color32::from_rgb(58, 59, 64)
-        } else {
-            Color32::from_rgb(234, 233, 228)
-        };
-        visuals.faint_bg_color = if dark {
-            Color32::from_rgb(37, 38, 42)
-        } else {
-            Color32::from_rgb(248, 247, 243)
-        };
-        visuals.error_fg_color = if dark {
-            Color32::LIGHT_RED
-        } else {
-            Color32::from_rgb(175, 30, 40)
-        };
-        context.set_visuals_of(theme, visuals);
+        let visuals = UIThemes::from_egui_theme(&theme);
+        context.set_visuals_of(theme, visuals.into());
     }
     context.set_theme(egui::ThemePreference::System);
     context.all_styles_mut(|style| {

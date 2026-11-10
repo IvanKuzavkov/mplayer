@@ -48,7 +48,7 @@ fn player_slider(
     ui.scope(|ui| {
         ui.spacing_mut().slider_width = width;
         ui.spacing_mut().slider_rail_height = 2.0;
-        ui.visuals_mut().selection.bg_fill = theme::accent(ui);
+        ui.visuals_mut().selection.bg_fill = theme::accent(ui.visuals());
         ui.add_enabled(
             enabled,
             egui::Slider::new(value, 0.0..=maximum)
@@ -94,7 +94,7 @@ pub(super) fn record_icon(painter: &egui::Painter, rect: egui::Rect) {
             egui::Stroke::new(stroke_width, egui::Color32::from_rgb(65, 74, 84)),
         );
     }
-    painter.circle_filled(center, radius * 0.3, theme::ACCENT);
+    painter.circle_filled(center, radius * 0.3, theme::ACCENT_DARK);
     painter.circle_stroke(
         center,
         radius * 0.3,
@@ -338,7 +338,7 @@ impl PlayerApp {
                     bits
                 ))
                 .size(12.0)
-                .color(theme::accent(ui)),
+                .color(theme::accent(ui.visuals())),
                 1,
                 10.0,
             ));

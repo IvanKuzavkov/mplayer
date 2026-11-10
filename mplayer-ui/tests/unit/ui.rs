@@ -283,7 +283,8 @@ fn system_theme_changes_update_panels_text_and_custom_controls_without_restart()
             },
             |ui| {
                 app.show(ui);
-                control_colors = Some((theme::accent(ui), ui.visuals().weak_text_color()));
+                control_colors =
+                    Some((theme::accent(ui.visuals()), ui.visuals().weak_text_color()));
             },
         );
         output.textures_delta.clear();

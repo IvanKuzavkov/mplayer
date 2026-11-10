@@ -505,7 +505,7 @@ impl PlayerApp {
                     ))
                     .size(12.0)
                     .color(if active {
-                        theme::accent(ui)
+                        theme::accent(ui.visuals())
                     } else {
                         ui.visuals().weak_text_color()
                     }),
@@ -528,7 +528,7 @@ impl PlayerApp {
                 if track.missing {
                     ui.visuals().error_fg_color
                 } else if active {
-                    theme::accent(ui)
+                    theme::accent(ui.visuals())
                 } else {
                     ui.visuals().strong_text_color()
                 },

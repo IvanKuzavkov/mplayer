@@ -124,7 +124,7 @@ impl PlayerApp {
                             ui.label(
                                 RichText::new(format!("{} paths queued", state.queued_imports))
                                     .small()
-                                    .color(theme::accent(ui)),
+                                    .color(theme::accent(ui.visuals())),
                             );
                         }
                     });

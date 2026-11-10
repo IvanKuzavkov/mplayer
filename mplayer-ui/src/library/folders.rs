@@ -41,7 +41,7 @@ impl PlayerApp {
         ui.horizontal_top(|ui| {
             let (rect, _) =
                 ui.allocate_exact_size(egui::vec2(icon_size, icon_size), egui::Sense::hover());
-            icon_buttons::folder_icon(ui.painter(), rect, theme::accent(ui));
+            icon_buttons::folder_icon(ui.painter(), rect, theme::accent(ui.visuals()));
             ui.add_space(8.0);
             ui.vertical(|ui| {
                 ui.add_space(8.0);

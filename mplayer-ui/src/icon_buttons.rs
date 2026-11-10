@@ -44,7 +44,7 @@ pub(super) fn icon_buttons(
     let button = if transport {
         button
             .fill(if prominent {
-                theme::accent(ui)
+                theme::accent(ui.visuals())
             } else {
                 ui.visuals().extreme_bg_color
             })
