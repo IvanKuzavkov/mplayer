@@ -67,9 +67,9 @@ impl UIThemes {
     }
 }
 
-impl Into<egui::style::Visuals> for UIThemes {
-    fn into(self) -> egui::Visuals {
-        self.into_visuals()
+impl From<UIThemes> for egui::style::Visuals {
+    fn from(val: UIThemes) -> Self {
+        val.into_visuals()
     }
 }
 
