@@ -407,7 +407,7 @@ fn build_stream<T: SizedSample + FromSample<f64>>(
     config: StreamConfig,
     mut consumer: HeapCons<f64>,
     state: Arc<CallbackState>,
-) -> std::result::Result<(cpal::Stream, HeapCons<cpal::Error>), cpal::Error> {
+) -> Result<(cpal::Stream, HeapCons<cpal::Error>)> {
     let (mut errors, error_receiver) = HeapRb::new(16).split();
     let failed_state = state.clone();
     let channels = usize::from(config.channels);
@@ -462,7 +462,7 @@ fn render<T: SizedSample + FromSample<f64>>(
         .min_queued_samples
         .fetch_min(queued as u64, Ordering::Relaxed);
     let available = queued.min(output.len()) / channels * channels;
-    let volume = f64::from(f32::from_bits(state.volume.load(Ordering::Relaxed)));
+    let volume = f32::from_bits(state.volume.load(Ordering::Relaxed)) as f64;
     let float_output = T::FORMAT.is_float();
     let maximum = if float_output {
         1.0
@@ -473,19 +473,20 @@ fn render<T: SizedSample + FromSample<f64>>(
         (1.0 - 2.0_f64.powi(1 - bits)).min(1.0_f64.next_down())
     };
     let (first, second) = consumer.as_slices();
-    for (sample, &value) in output[..available]
-        .iter_mut()
-        .zip(first.iter().chain(second))
-    {
-        let value = if !value.is_finite() {
+    let mut sound_output = first.iter().chain(second).map(|v| {
+        let v = if !v.is_finite() {
             0.0
         } else if volume == 1.0 && float_output {
-            value
+            *v
         } else {
-            (if volume == 1.0 { value } else { value * volume }).clamp(-1.0, maximum)
+            (if volume == 1.0 { *v } else { *v * volume }).clamp(-1.0, maximum)
         };
-        *sample = T::from_sample(value);
-    }
+        T::from_sample(v)
+    });
+    output[..available]
+        .iter_mut()
+        .for_each(|v| *v = sound_output.next().unwrap_or_else(|| T::from_sample(0.0)));
+
     consumer.skip(available);
     output[available..].fill(T::from_sample(0.0));
     state

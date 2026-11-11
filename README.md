@@ -214,6 +214,11 @@ python3 mplayer-audio/tests/compare_dsd.py "/path/to/track.dsf" --positions 110 
 python3 mplayer-audio/tests/compare_dsd.py --self-test
 ```
 
+Positions are the centers of ten-second windows (110 and 121 seconds by default);
+windows near the beginning start at zero. `--output PATH` changes the parent
+artifact directory. Each invocation creates its own run directory, preserving
+earlier reports. The self-test requires NumPy but does not use FFmpeg or Cargo.
+
 The diagnostic checks sample-exact agreement between continuous, seeked, and
 sequential-filter decoding, and verifies playback-queue delivery through an i32
 callback using simulated 883- and 3528-frame periods. It then compares ten-second
