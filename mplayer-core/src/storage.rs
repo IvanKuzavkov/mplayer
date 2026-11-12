@@ -79,7 +79,7 @@ impl Store {
             .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
-            .max_connections(4)
+            .max_connections(2)
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;

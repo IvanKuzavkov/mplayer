@@ -301,6 +301,68 @@ fn dsd_file_callback_correctness() {
 }
 
 #[test]
+fn paused_worker_stays_quiet_and_still_reports_commands_progress_and_device_events() {
+    let (_fixture, track) = fixture(1, 8192);
+    let (sender, snapshots) = watch::channel(PlaybackSnapshot::default());
+    let (commands, receiver) = mpsc::sync_channel(4);
+    let (wakes, wakeups) = mpsc::channel();
+    let (output, callbacks) = mpsc::channel();
+    let thread = thread::spawn(move || {
+        let (mut worker, consumer, state) = worker(track, None);
+        worker.sender = sender;
+        worker.wake = Arc::new(move || {
+            let _ = wakes.send(());
+        });
+        worker.command(AudioCommand::Pause).unwrap();
+        output.send((consumer, state)).unwrap();
+        worker.run(receiver);
+    });
+    let (mut consumer, state) = callbacks.recv_timeout(Duration::from_secs(3)).unwrap();
+    wakeups.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(snapshots.borrow().state, PlaybackState::Paused);
+    assert_eq!(
+        wakeups.recv_timeout(Duration::from_millis(250)),
+        Err(mpsc::RecvTimeoutError::Timeout),
+        "unchanged paused playback must not repaint"
+    );
+
+    commands.send(AudioCommand::SetVolume(0.5)).unwrap();
+    wakeups.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(snapshots.borrow().volume, 0.5);
+
+    state.device_underruns.fetch_add(1, Ordering::Relaxed);
+    wakeups.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(snapshots.borrow().underruns, 1);
+    assert_eq!(
+        wakeups.recv_timeout(Duration::from_millis(250)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    );
+
+    commands.send(AudioCommand::Resume).unwrap();
+    wakeups.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(snapshots.borrow().state, PlaybackState::Playing);
+    let mut rendered = [0.0_f64; 800];
+    output::test_consume(&mut consumer, &mut rendered, 1, &state);
+    assert_eq!(rendered, [0.125; 800]);
+    wakeups.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(snapshots.borrow().position_ms, 100);
+
+    commands.send(AudioCommand::Pause).unwrap();
+    wakeups.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(snapshots.borrow().state, PlaybackState::Paused);
+    state.failed.store(true, Ordering::Relaxed);
+    wakeups.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(snapshots.borrow().position_ms, 100);
+    assert_eq!(
+        snapshots.borrow().notification.as_deref(),
+        Some("Audio output device changed. Playback paused.")
+    );
+
+    commands.send(AudioCommand::Shutdown).unwrap();
+    thread.join().unwrap();
+}
+
+#[test]
 fn periodic_diagnostics_reset_measurements_without_changing_playback() {
     let (_fixture, track) = fixture(1, 8192);
     let (mut worker, mut consumer, callback) = worker(track, None);

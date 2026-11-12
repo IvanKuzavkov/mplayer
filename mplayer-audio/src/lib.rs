@@ -286,7 +286,8 @@ impl Worker {
         tracing::info!("Audio worker started");
         self.publish();
         while !self.stop.load(Ordering::Relaxed) {
-            let timeout = if self.output.is_some() {
+            let timeout = if self.output.is_some() && self.snapshot.state == PlaybackState::Playing
+            {
                 Duration::from_millis(5)
             } else {
                 Duration::from_millis(100)
@@ -978,8 +979,18 @@ impl Worker {
             );
             self.snapshot.underruns = underruns;
         }
-        self.sender.send_replace(self.snapshot.clone());
-        (self.wake)();
+        // Paused streams still poll for device failures and underruns. Only wake
+        // the UI when that polling changes something it can display.
+        if self.sender.send_if_modified(|previous| {
+            if *previous == self.snapshot {
+                false
+            } else {
+                previous.clone_from(&self.snapshot);
+                true
+            }
+        }) {
+            (self.wake)();
+        }
         self.last_publish = Instant::now();
     }
 }

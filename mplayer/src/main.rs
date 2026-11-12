@@ -16,7 +16,7 @@ use std::{
 use tokio::sync::{mpsc, watch};
 use tracing::Instrument;
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     let data = config::data_directory()?;
     tokio::fs::create_dir_all(&data).await?;

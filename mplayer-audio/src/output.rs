@@ -26,6 +26,9 @@ pub(crate) struct CallbackState {
     pub latency_ns: AtomicU64,
     pub paused: AtomicBool,
     pub volume: AtomicU32,
+    fade_frames: u32,
+    // Only the callback advances this position; all channels share one gain.
+    fade_position: AtomicU32,
 }
 
 impl CallbackState {
@@ -293,7 +296,11 @@ impl Output {
         let channels = usize::from(config.channels);
         let capacity = (rate as usize / 2).max(4096) * channels;
         let (producer, consumer) = HeapRb::<f64>::new(capacity).split();
-        let state = Arc::new(CallbackState::default());
+        let state = Arc::new(CallbackState {
+            // A 5 ms ramp, rounded up to a whole audio frame.
+            fade_frames: rate.div_ceil(200),
+            ..Default::default()
+        });
         state.paused.store(true, Ordering::Relaxed);
         state.volume.store(volume.to_bits(), Ordering::Relaxed);
         state.min_queued_samples.store(u64::MAX, Ordering::Relaxed);
@@ -453,7 +460,9 @@ fn render<T: SizedSample + FromSample<f64>>(
     channels: usize,
     state: &CallbackState,
 ) {
-    if state.paused.load(Ordering::Relaxed) {
+    let paused = state.paused.load(Ordering::Relaxed);
+    let mut fade_position = state.fade_position.load(Ordering::Relaxed);
+    if paused && fade_position == 0 {
         output.fill(T::from_sample(0.0));
         return;
     }
@@ -462,6 +471,12 @@ fn render<T: SizedSample + FromSample<f64>>(
         .min_queued_samples
         .fetch_min(queued as u64, Ordering::Relaxed);
     let available = queued.min(output.len()) / channels * channels;
+    // Finish fading before preserving the remaining queue for resume.
+    let available = if paused {
+        available.min(fade_position as usize * channels)
+    } else {
+        available
+    };
     let volume = f32::from_bits(state.volume.load(Ordering::Relaxed)) as f64;
     let float_output = T::FORMAT.is_float();
     let maximum = if float_output {
@@ -473,26 +488,44 @@ fn render<T: SizedSample + FromSample<f64>>(
         (1.0 - 2.0_f64.powi(1 - bits)).min(1.0_f64.next_down())
     };
     let (first, second) = consumer.as_slices();
-    let mut sound_output = first.iter().chain(second).map(|v| {
-        let v = if !v.is_finite() {
-            0.0
-        } else if volume == 1.0 && float_output {
-            *v
+    let mut samples = first.iter().chain(second);
+    for frame in output[..available].chunks_exact_mut(channels) {
+        fade_position = if paused {
+            fade_position.saturating_sub(1)
         } else {
-            (if volume == 1.0 { *v } else { *v * volume }).clamp(-1.0, maximum)
+            (fade_position + 1).min(state.fade_frames)
         };
-        T::from_sample(v)
-    });
-    output[..available]
-        .iter_mut()
-        .for_each(|v| *v = sound_output.next().unwrap_or_else(|| T::from_sample(0.0)));
+        let gain = if fade_position < state.fade_frames {
+            let progress = f64::from(fade_position) / f64::from(state.fade_frames);
+            // Exponential audio taper over 60 dB, normalized to exact silence.
+            volume * (progress * (3.0 * std::f64::consts::LN_10)).exp_m1() / 999.0
+        } else {
+            volume
+        };
+        for (sample, &v) in frame.iter_mut().zip(samples.by_ref()) {
+            let v = if !v.is_finite() {
+                0.0
+            } else if gain == 1.0 && float_output {
+                v
+            } else {
+                (if gain == 1.0 { v } else { v * gain }).clamp(-1.0, maximum)
+            };
+            *sample = T::from_sample(v);
+        }
+    }
+    if paused && available < output.len() {
+        // An empty queue already produced silence; do not restart a fade-out
+        // if the worker refills it while paused.
+        fade_position = 0;
+    }
+    state.fade_position.store(fade_position, Ordering::Relaxed);
 
     consumer.skip(available);
     output[available..].fill(T::from_sample(0.0));
     state
         .consumed
         .fetch_add(available as u64, Ordering::Relaxed);
-    if available < output.len() && !state.ending.load(Ordering::Relaxed) {
+    if !paused && available < output.len() && !state.ending.load(Ordering::Relaxed) {
         state.underruns.fetch_add(1, Ordering::Relaxed);
     }
 }
