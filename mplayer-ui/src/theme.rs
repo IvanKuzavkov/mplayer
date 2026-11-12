@@ -74,6 +74,17 @@ impl From<UIThemes> for egui::style::Visuals {
 }
 
 pub fn apply(context: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "Figtree".into(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/Figtree-Regular.ttf")).into(),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "Figtree".into());
+    context.set_fonts(fonts);
     for theme in [egui::Theme::Dark, egui::Theme::Light] {
         let visuals = UIThemes::from_egui_theme(&theme);
         context.set_visuals_of(theme, visuals.into());
