@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
-    time::UNIX_EPOCH,
 };
 
 use anyhow::Context;
@@ -43,6 +42,12 @@ struct Scanner {
 }
 
 impl Scanner {
+    fn supported_extensions<'a>() -> &'a [&'a str] {
+        &[
+            "flac", "wav", "wave", "mp3", "ogg", "oga", "dsf", "dff", "cue",
+        ]
+    }
+
     fn publish(&self) {
         self.progress.send_replace(self.state.clone());
     }
@@ -150,9 +155,7 @@ impl Scanner {
         let walk = tokio::task::spawn_blocking(move || {
             span.in_scope(|| {
                 WalkBuilder::new(path)
-                    .extensions([
-                        "flac", "wav", "wave", "mp3", "ogg", "oga", "dsf", "dff", "cue",
-                    ])
+                    .extensions(Scanner::supported_extensions())
                     .sort(Sort::Name)
                     .build()
             })
@@ -210,16 +213,14 @@ impl Scanner {
                 directories.insert(path);
                 continue;
             }
-            if supported(&path) {
-                inventories
-                    .entry(path.parent().context("media has no parent")?.into())
-                    .or_default()
-                    .push(InventoryFile {
-                        path,
-                        modified_secs: entry.modified,
-                        file_size: entry.size,
-                    });
-            }
+            inventories
+                .entry(path.parent().context("media has no parent")?.into())
+                .or_default()
+                .push(InventoryFile {
+                    path,
+                    modified_secs: entry.modified,
+                    file_size: entry.size,
+                });
         }
         let existing = self.store.root_folders(root.id).await?;
         for folder in &existing {
@@ -280,28 +281,33 @@ impl Scanner {
     }
 
     async fn read_folder(&self, path: &Path) -> Result<Vec<InventoryFile>> {
-        let mut entries = tokio::fs::read_dir(path).await?;
+        let span = tracing::Span::current();
+        let cloned_path = path.to_path_buf();
+        let entries = tokio::task::spawn_blocking(move || {
+            span.in_scope(|| {
+                WalkBuilder::new(cloned_path)
+                    .max_depth(1)
+                    .extensions(Scanner::supported_extensions())
+                    .sort(Sort::Name)
+                    .build()
+            })
+        })
+        .await?
+        .map_err(|e| match e {
+            dirwalk::Error::Io { path: _, source } => source,
+        })?;
         let mut files = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
-            if entry.file_name().as_encoded_bytes().first() == Some(&b'.')
-                || !entry.file_type().await?.is_file()
-                || !supported(&entry.path())
-            {
+        for entry in entries.entries {
+            if entry.is_dir || entry.is_symlink {
                 continue;
             }
-            let metadata = entry.metadata().await?;
-            let modified_secs = metadata
-                .modified()?
-                .duration_since(UNIX_EPOCH)?
-                .as_secs()
-                .try_into()?;
+
             files.push(InventoryFile {
-                path: entry.path(),
-                modified_secs,
-                file_size: metadata.len(),
+                path: path.join(entry.relative_path),
+                modified_secs: entry.modified,
+                file_size: entry.size,
             });
         }
-        files.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(files)
     }
 
@@ -452,15 +458,6 @@ impl Drop for Scanner {
 fn is_cue(path: &Path) -> bool {
     path.extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("cue"))
-}
-fn supported(path: &Path) -> bool {
-    path.extension().is_some_and(|ext| {
-        [
-            "flac", "wav", "wave", "mp3", "ogg", "oga", "dsf", "dff", "cue",
-        ]
-        .iter()
-        .any(|supported| ext.eq_ignore_ascii_case(supported))
-    })
 }
 
 #[tracing::instrument(skip_all, fields(?request), err)]
