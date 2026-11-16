@@ -7,6 +7,7 @@ mod list_rows;
 mod navigation;
 mod player;
 mod playlists;
+mod subscriptions;
 mod theme;
 mod thumbnails;
 
@@ -14,8 +15,11 @@ use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 pub use eframe;
 use eframe::egui::{self, RichText};
-use mplayer_core::{AppCommand, AppSnapshot, LibraryFilter, PlayMode, PlaybackState, Track};
-use tokio::sync::{mpsc, watch};
+use mplayer_core::{
+    AppCommand, AppSnapshot, ArtworkClient, CommandEnvelope, CommandRouter, LibraryCommand,
+    LibraryFilter, PlayMode, PlaybackCommand, PlaybackState, Track, UiSubscriptions,
+};
+use tokio::sync::mpsc;
 
 const MAX_PENDING: usize = 64;
 
@@ -37,27 +41,30 @@ enum LibraryTab {
 
 #[derive(Default)]
 struct Outbox {
-    pending: VecDeque<AppCommand>,
+    pending: VecDeque<CommandEnvelope<AppCommand>>,
     disconnected: bool,
 }
 impl Outbox {
-    fn push(&mut self, command: AppCommand) -> bool {
+    fn push(&mut self, command: CommandEnvelope<AppCommand>) -> bool {
         if self.disconnected {
+            command.trace.event("ui", "rejected_closed");
             return false;
         }
         if let Some(previous) = self.pending.back_mut()
-            && coalesces(previous, &command)
+            && coalesces(&previous.payload, &command.payload)
         {
+            previous.trace.superseded_by(&command.trace, "ui");
             *previous = command;
             return true;
         }
         if self.pending.len() >= MAX_PENDING {
+            command.trace.event("ui", "rejected_full");
             return false;
         }
         self.pending.push_back(command);
         true
     }
-    fn flush(&mut self, sender: &mpsc::Sender<AppCommand>) {
+    fn flush(&mut self, sender: &CommandRouter) {
         while let Some(command) = self.pending.pop_front() {
             match sender.try_send(command) {
                 Ok(()) => (),
@@ -66,42 +73,62 @@ impl Outbox {
                     break;
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    self.disconnected = true;
-                    self.pending.clear();
+                    self.disconnect();
                     break;
                 }
             }
         }
     }
+    fn disconnect(&mut self) {
+        self.disconnected = true;
+        for command in self.pending.drain(..) {
+            command.trace.event("ui", "cancelled");
+        }
+    }
+}
+impl Drop for Outbox {
+    fn drop(&mut self) {
+        self.disconnect();
+    }
 }
 fn coalesces(previous: &AppCommand, next: &AppCommand) -> bool {
     if let (
-        AppCommand::BrowseLibrary {
+        AppCommand::Library(LibraryCommand::BrowseLibrary {
             filter: previous, ..
-        },
-        AppCommand::BrowseLibrary { filter: next, .. },
+        }),
+        AppCommand::Library(LibraryCommand::BrowseLibrary { filter: next, .. }),
     ) = (previous, next)
     {
         return previous == next;
     }
     matches!(
         (previous, next),
-        (AppCommand::Seek { .. }, AppCommand::Seek { .. })
-            | (AppCommand::SetVolume(_), AppCommand::SetVolume(_))
-            | (AppCommand::Search { .. }, AppCommand::Search { .. })
-            | (
-                AppCommand::ListFolders { .. },
-                AppCommand::ListFolders { .. }
-            )
-            | (AppCommand::ListAlbums { .. }, AppCommand::ListAlbums { .. })
+        (
+            AppCommand::Playback(PlaybackCommand::Seek { .. }),
+            AppCommand::Playback(PlaybackCommand::Seek { .. })
+        ) | (
+            AppCommand::Playback(PlaybackCommand::SetVolume(_)),
+            AppCommand::Playback(PlaybackCommand::SetVolume(_))
+        ) | (
+            AppCommand::Library(LibraryCommand::Search { .. }),
+            AppCommand::Library(LibraryCommand::Search { .. })
+        ) | (
+            AppCommand::Library(LibraryCommand::ListFolders { .. }),
+            AppCommand::Library(LibraryCommand::ListFolders { .. })
+        ) | (
+            AppCommand::Library(LibraryCommand::ListAlbums { .. }),
+            AppCommand::Library(LibraryCommand::ListAlbums { .. })
+        )
     )
 }
 
 pub struct PlayerApp {
-    commands: mpsc::Sender<AppCommand>,
-    state: watch::Receiver<AppSnapshot>,
+    commands: CommandRouter,
+    state: UiSubscriptions,
     snapshot: Arc<AppSnapshot>,
     outbox: Outbox,
+    library_outbox: Outbox,
+    repaint_task: Option<tokio::task::JoinHandle<()>>,
     view: View,
     queue_return_view: View,
     tab: LibraryTab,
@@ -163,8 +190,8 @@ pub struct PlayerApp {
     transport_buttons: [Option<egui::Rect>; 3],
 }
 impl PlayerApp {
-    pub fn new(commands: mpsc::Sender<AppCommand>, state: watch::Receiver<AppSnapshot>) -> Self {
-        let snapshot = Arc::new(state.borrow().clone());
+    pub fn new(commands: CommandRouter, mut state: UiSubscriptions) -> Self {
+        let snapshot = Arc::new(subscriptions::snapshot(&mut state));
         Self {
             search: snapshot.library.query.clone(),
             seek_request_id: snapshot.playback.seek_request_id,
@@ -172,6 +199,8 @@ impl PlayerApp {
             commands,
             state,
             outbox: Outbox::default(),
+            library_outbox: Outbox::default(),
+            repaint_task: None,
             view: View::Library,
             queue_return_view: View::Library,
             tab: LibraryTab::Tracks,
@@ -231,12 +260,19 @@ impl PlayerApp {
             transport_buttons: [None; 3],
         }
     }
-    pub fn with_artwork_probe(mut self, probe: Arc<dyn mplayer_core::MetadataProbe>) -> Self {
-        self.thumbnails.probe = Some(probe);
+    pub fn with_artwork_client(mut self, client: ArtworkClient) -> Self {
+        self.thumbnails.client = Some(client);
         self
     }
     fn available(&self) -> bool {
-        !self.outbox.disconnected && self.outbox.pending.len() < MAX_PENDING
+        !self.library_outbox.disconnected
+            && self.library_outbox.pending.len() < MAX_PENDING
+            && !self.commands.library_closed()
+    }
+    fn playback_available(&self) -> bool {
+        !self.outbox.disconnected
+            && self.outbox.pending.len() < MAX_PENDING
+            && !self.commands.playback_closed()
     }
 
     fn toggle_queue(&mut self) {
@@ -248,21 +284,27 @@ impl PlayerApp {
         }
     }
 
-    #[tracing::instrument(skip_all, level="debug", fields(command = ?command))]
-    fn submit(&mut self, command: AppCommand) -> bool {
+    #[tracing::instrument(skip_all, level = "debug")]
+    fn submit(&mut self, command: impl Into<AppCommand>) -> bool {
+        let command = command.into();
         let changes_track = matches!(
             &command,
-            AppCommand::Play(_)
-                | AppCommand::PlayQueue(_)
-                | AppCommand::PlayPlaylist(_)
-                | AppCommand::Previous
-                | AppCommand::Next
-                | AppCommand::Stop
-                | AppCommand::ClearQueue
+            AppCommand::Playback(PlaybackCommand::Play(_))
+                | AppCommand::Playback(PlaybackCommand::PlayQueue(_))
+                | AppCommand::Playback(PlaybackCommand::PlayPlaylist(_))
+                | AppCommand::Playback(PlaybackCommand::Previous)
+                | AppCommand::Playback(PlaybackCommand::Next)
+                | AppCommand::Playback(PlaybackCommand::Stop)
+                | AppCommand::Playback(PlaybackCommand::ClearQueue)
         );
-        if !self.outbox.push(command) {
+        let outbox = if matches!(&command, AppCommand::Library(_)) {
+            &mut self.library_outbox
+        } else {
+            &mut self.outbox
+        };
+        if !outbox.push(self.commands.prepare(command)) {
             self.message = Some(
-                if self.outbox.disconnected {
+                if outbox.disconnected {
                     "The player service has stopped. Restart the player."
                 } else {
                     "The player is busy. Please retry shortly."
@@ -276,13 +318,19 @@ impl PlayerApp {
             self.pending_seek = None;
         }
         self.outbox.flush(&self.commands);
+        self.library_outbox.flush(&self.commands);
         true
     }
     fn refresh(&mut self, context: &egui::Context) {
-        let changed = self.state.has_changed();
-        let closed = changed.is_err();
-        if changed.unwrap_or(true) {
-            let next = self.state.borrow_and_update().clone();
+        if self.repaint_task.is_none()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            self.repaint_task =
+                Some(runtime.spawn(subscriptions::repaint(self.state.clone(), context.clone())));
+        }
+        let closed = self.state.player.has_changed().is_err();
+        if subscriptions::changed(&self.state) {
+            let next = subscriptions::snapshot(&mut self.state);
             if !next.scan.running
                 && (self.snapshot.scan.running
                     || self.snapshot.scan.folder_revision != next.scan.folder_revision)
@@ -312,14 +360,17 @@ impl PlayerApp {
             }
             self.snapshot = Arc::new(next);
         }
-        if closed || self.commands.is_closed() {
-            self.outbox.disconnected = true;
-            self.outbox.pending.clear();
+        if closed || self.commands.playback_closed() {
+            self.outbox.disconnect();
             self.seek_draft = None;
             self.pending_seek = None;
         }
         self.outbox.flush(&self.commands);
-        if !self.outbox.pending.is_empty() {
+        self.library_outbox.flush(&self.commands);
+        if self.state.library.has_changed().is_err() || self.commands.library_closed() {
+            self.library_outbox.disconnect();
+        }
+        if !self.outbox.pending.is_empty() || !self.library_outbox.pending.is_empty() {
             context.request_repaint_after(Duration::from_millis(30));
         }
         self.cover.update(self.snapshot.artwork.as_ref(), context);
@@ -356,13 +407,13 @@ impl PlayerApp {
                 .collect()
         });
         if !dropped.is_empty() {
-            self.submit(AppCommand::Import(dropped));
+            self.submit(LibraryCommand::Import(dropped));
         }
         if !self.folders.is_open()
             && !ui.ctx().egui_wants_keyboard_input()
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Space))
         {
-            self.submit(AppCommand::PauseResume);
+            self.submit(PlaybackCommand::PauseResume);
         }
         let state = Arc::clone(&self.snapshot);
         egui::Panel::left("navigation")
@@ -420,7 +471,7 @@ impl PlayerApp {
                 View::Playlists => self.playlists(ui, &state),
             });
         if let Some(paths) = self.folders.show(ui.ctx(), self.available())
-            && self.submit(AppCommand::Import(paths))
+            && self.submit(LibraryCommand::Import(paths))
         {
             self.folders.close();
         }
@@ -455,3 +506,11 @@ fn track_title(track: &Track) -> String {
 #[cfg(test)]
 #[path = "../tests/unit/ui.rs"]
 mod tests;
+
+impl Drop for PlayerApp {
+    fn drop(&mut self) {
+        if let Some(task) = self.repaint_task.take() {
+            task.abort();
+        }
+    }
+}

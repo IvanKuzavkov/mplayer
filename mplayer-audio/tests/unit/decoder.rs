@@ -343,7 +343,7 @@ fn album_artist_and_track_disc_numbers_are_extracted_from_flac_comments() {
         comments.extend_from_slice(tag.as_bytes());
     }
     let fixture = flac_with_blocks(vec![(4, comments)]);
-    let metadata = SymphoniaProbe.probe(&fixture.0).unwrap();
+    let metadata = crate::metadata_probe().probe(&fixture.0).unwrap();
     assert_eq!(metadata.title, "Blue");
     assert_eq!(metadata.artist, "Soloist");
     assert_eq!(metadata.album, "Record");
@@ -361,29 +361,40 @@ fn unavailable_or_invalid_years_are_not_invented() {
         comments.extend_from_slice(&(tag.len() as u32).to_le_bytes());
         comments.extend_from_slice(tag.as_bytes());
         let fixture = flac_with_blocks(vec![(4, comments)]);
-        assert_eq!(SymphoniaProbe.probe(&fixture.0).unwrap().year, None);
+        assert_eq!(
+            crate::metadata_probe().probe(&fixture.0).unwrap().year,
+            None
+        );
     }
 }
 
 #[test]
 fn embedded_artwork_prefers_front_cover_and_never_enters_track_metadata() {
     let fixture = flac_with_blocks(vec![(6, picture(4, b"back")), (6, picture(3, b"front"))]);
-    let artwork = SymphoniaProbe.artwork(&fixture.0).unwrap().unwrap();
+    let artwork = crate::metadata_probe()
+        .artwork(&fixture.0)
+        .unwrap()
+        .unwrap();
     assert_eq!(artwork.data.as_ref(), b"front");
     assert_eq!(artwork.mime_type, "image/png");
-    let metadata = SymphoniaProbe.probe(&fixture.0).unwrap();
+    let metadata = crate::metadata_probe().probe(&fixture.0).unwrap();
     assert_eq!(metadata.sample_rate, 44_100);
     assert_eq!(metadata.duration_ms, 100);
     let plain = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tone16.flac");
-    assert!(SymphoniaProbe.artwork(&plain).unwrap().is_none());
+    assert!(crate::metadata_probe().artwork(&plain).unwrap().is_none());
 }
 
 #[test]
 fn oversized_flac_artwork_is_skipped_and_truncated_picture_reports_error() {
     let fixture = flac_with_blocks(vec![(6, picture(3, &vec![0; MAX_ARTWORK_BYTES + 1]))]);
-    assert!(SymphoniaProbe.artwork(&fixture.0).unwrap().is_none());
+    assert!(
+        crate::metadata_probe()
+            .artwork(&fixture.0)
+            .unwrap()
+            .is_none()
+    );
     let truncated = flac_with_blocks(vec![(6, vec![0; 3])]);
-    assert!(SymphoniaProbe.artwork(&truncated.0).is_err());
+    assert!(crate::metadata_probe().artwork(&truncated.0).is_err());
 }
 
 #[test]
@@ -411,7 +422,10 @@ fn mp3_id3_front_cover_uses_the_generic_metadata_artwork_path() {
     ));
     std::fs::write(&path, bytes).unwrap();
     let fixture = Fixture(path);
-    let artwork = SymphoniaProbe.artwork(&fixture.0).unwrap().unwrap();
+    let artwork = crate::metadata_probe()
+        .artwork(&fixture.0)
+        .unwrap()
+        .unwrap();
     assert_eq!(artwork.data.as_ref(), b"embedded-front");
     assert_eq!(artwork.mime_type, "image/png");
 }

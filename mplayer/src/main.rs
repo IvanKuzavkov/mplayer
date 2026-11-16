@@ -6,14 +6,10 @@ mod logging;
 #[path = "../tests/unit/icon.rs"]
 mod icon_tests;
 
-use mplayer_audio::{AudioEngine, SymphoniaProbe};
-use mplayer_core::{AppCommand, AppSnapshot, Result, Store, Wake};
+use mplayer_audio::{AudioEngine, metadata_probe};
+use mplayer_core::{LibraryCommand, Result, Store};
 use mplayer_ui::eframe;
-use std::{
-    path::PathBuf,
-    sync::{Arc, OnceLock},
-};
-use tokio::sync::{mpsc, watch};
+use std::{path::PathBuf, sync::Arc};
 use tracing::Instrument;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -33,32 +29,22 @@ async fn run(
 ) -> Result<()> {
     tracing::info!(data_directory = %data.display(), "starting music player");
     let store = Store::open(&data.join("library.sqlite3")).await?;
-    let context = Arc::new(OnceLock::<eframe::egui::Context>::new());
-    let wake: Wake = {
-        let context = Arc::clone(&context);
-        Arc::new(move || {
-            if let Some(context) = context.get() {
-                context.request_repaint();
-            }
-        })
-    };
-    let audio = AudioEngine::start(Arc::clone(&wake))?;
-    let (commands, receiver) = mpsc::channel(64);
-    let (state, snapshots) = watch::channel(AppSnapshot::default());
-    let app = app::Application::new(
+    let audio = AudioEngine::start()?;
+    let app = app::Application::start(
         store.clone(),
         audio.sender(),
         audio.subscribe(),
-        receiver,
-        state,
-        wake,
-        Arc::new(SymphoniaProbe),
+        Arc::new(metadata_probe()),
         dropped_logs,
-    );
+    )
+    .await?;
+    let commands = app.commands.clone();
+    let snapshots = app.subscriptions.clone();
+    let artwork = app.artwork.clone();
     let task = tokio::spawn(app.run().in_current_span());
     let startup_files: Vec<_> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     if !startup_files.is_empty() {
-        let _ = commands.try_send(AppCommand::Import(startup_files));
+        let _ = commands.try_send(commands.prepare(LibraryCommand::Import(startup_files)));
     }
     let ui_commands = commands.clone();
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/app-icon.png"))?;
@@ -74,16 +60,14 @@ async fn run(
     let ui_result = eframe::run_native(
         "mplayer",
         options,
-        Box::new(move |creation| {
-            let _ = context.set(creation.egui_ctx.clone());
+        Box::new(move |_creation| {
             Ok(Box::new(
-                mplayer_ui::PlayerApp::new(ui_commands, snapshots)
-                    .with_artwork_probe(Arc::new(SymphoniaProbe)),
+                mplayer_ui::PlayerApp::new(ui_commands, snapshots).with_artwork_client(artwork),
             ))
         }),
     );
     let service_result: Result<()> = async {
-        let _ = commands.send(AppCommand::Shutdown).await;
+        commands.shutdown();
         task.await?
     }
     .await;

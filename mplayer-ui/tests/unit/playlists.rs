@@ -5,8 +5,8 @@ fn duplicate_playlist_notice_stays_above_creation_and_minus_deletes_only_playlis
     for size in [[950.0, 620.0], [1150.0, 760.0]] {
         let mut snapshot = populated();
         snapshot.selected_playlist = None;
-        let (sender, mut receiver) = mpsc::channel(64);
-        let (_state, snapshots) = watch::channel(snapshot);
+        let (sender, mut receiver) = command_channel(64);
+        let (_state, snapshots) = snapshot_channel(snapshot);
         let mut app = PlayerApp::new(sender, snapshots);
         app.view = View::Playlists;
         let context = egui::Context::default();
@@ -45,7 +45,7 @@ fn duplicate_playlist_notice_stays_above_creation_and_minus_deletes_only_playlis
         click_at(&mut app, &context, size, minus.center());
         assert!(matches!(
             receiver.try_recv(),
-            Ok(AppCommand::DeletePlaylist(1))
+            Ok(AppCommand::Library(LibraryCommand::DeletePlaylist(1)))
         ));
         assert!(receiver.try_recv().is_err());
     }
@@ -112,8 +112,8 @@ fn playlist_header_queue_rows_removal_and_dragging_use_entry_identity() {
                 track: missing,
             },
         ]);
-        let (sender, mut receiver) = mpsc::channel(64);
-        let (state, snapshots) = watch::channel(snapshot);
+        let (sender, mut receiver) = command_channel(64);
+        let (state, snapshots) = snapshot_channel(snapshot);
         let mut app = PlayerApp::new(sender, snapshots);
         app.view = View::Playlists;
         let context = egui::Context::default();
@@ -148,13 +148,15 @@ fn playlist_header_queue_rows_removal_and_dragging_use_entry_identity() {
         click_at(&mut app, &context, size, play.center());
         assert!(matches!(
             receiver.try_recv(),
-            Ok(AppCommand::PlayPlaylist(1))
+            Ok(AppCommand::Playback(PlaybackCommand::PlayPlaylist(1)))
         ));
         let minus = app.queue_buttons[2].center();
         click_at(&mut app, &context, size, minus);
         assert!(matches!(
             receiver.try_recv(),
-            Ok(AppCommand::RemovePlaylistEntry(103))
+            Ok(AppCommand::Library(LibraryCommand::RemovePlaylistEntry(
+                103
+            )))
         ));
         assert!(receiver.try_recv().is_err());
         let source = app.playlist_rows[0].center();
@@ -162,10 +164,10 @@ fn playlist_header_queue_rows_removal_and_dragging_use_entry_identity() {
         drag_row(&mut app, &context, size, source, target);
         assert!(matches!(
             receiver.try_recv(),
-            Ok(AppCommand::MovePlaylistEntry {
+            Ok(AppCommand::Library(LibraryCommand::MovePlaylistEntry {
                 entry_id: 101,
                 position: 2
-            })
+            }))
         ));
         assert!(receiver.try_recv().is_err());
         state.send_modify(|snapshot| {
@@ -179,17 +181,19 @@ fn playlist_header_queue_rows_removal_and_dragging_use_entry_identity() {
         drag_row(&mut app, &context, size, source, target);
         assert!(matches!(
             receiver.try_recv(),
-            Ok(AppCommand::MovePlaylistEntry {
+            Ok(AppCommand::Library(LibraryCommand::MovePlaylistEntry {
                 entry_id: 101,
                 position: 0
-            })
+            }))
         ));
         assert!(receiver.try_recv().is_err());
         let minus = app.queue_buttons[0].center();
         click_at(&mut app, &context, size, minus);
         assert!(matches!(
             receiver.try_recv(),
-            Ok(AppCommand::RemovePlaylistEntry(102))
+            Ok(AppCommand::Library(LibraryCommand::RemovePlaylistEntry(
+                102
+            )))
         ));
     }
 }
@@ -199,8 +203,8 @@ fn playlist_overview_creates_opens_and_returns_from_detail() {
     let mut snapshot = populated();
     snapshot.selected_playlist = None;
     snapshot.playlist_entries = Arc::default();
-    let (sender, mut receiver) = mpsc::channel(64);
-    let (state, snapshots) = watch::channel(snapshot.clone());
+    let (sender, mut receiver) = command_channel(64);
+    let (state, snapshots) = snapshot_channel(snapshot.clone());
     let mut app = PlayerApp::new(sender, snapshots);
     let context = egui::Context::default();
     click(&mut app, &context, "Playlists");
@@ -216,13 +220,13 @@ fn playlist_overview_creates_opens_and_returns_from_detail() {
     let create = app.playlist_create.unwrap().center();
     click_at(&mut app, &context, [1150.0, 760.0], create);
     assert!(
-        matches!(receiver.try_recv(), Ok(AppCommand::CreatePlaylist(name)) if name == "Weekend")
+        matches!(receiver.try_recv(), Ok(AppCommand::Library(LibraryCommand::CreatePlaylist(name))) if name == "Weekend")
     );
     assert!(app.playlist_name.is_empty());
     click(&mut app, &context, "Favourites");
     assert!(matches!(
         receiver.try_recv(),
-        Ok(AppCommand::SelectPlaylist(Some(1)))
+        Ok(AppCommand::Library(LibraryCommand::SelectPlaylist(Some(1))))
     ));
     snapshot.selected_playlist = Some(1);
     state.send_replace(snapshot.clone());
@@ -239,7 +243,7 @@ fn playlist_overview_creates_opens_and_returns_from_detail() {
     click_at(&mut app, &context, [1150.0, 760.0], back);
     assert!(matches!(
         receiver.try_recv(),
-        Ok(AppCommand::SelectPlaylist(None))
+        Ok(AppCommand::Library(LibraryCommand::SelectPlaylist(None)))
     ));
     snapshot.selected_playlist = None;
     state.send_replace(snapshot);

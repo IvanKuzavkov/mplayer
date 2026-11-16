@@ -15,18 +15,22 @@ impl PlayerApp {
     fn library_page(&mut self, offset: u64) {
         let query = self.search.clone();
         let command = match (&self.tab, &self.group) {
-            (LibraryTab::Folders, None) => AppCommand::ListFolders { query, offset },
-            (LibraryTab::Albums, None) => AppCommand::ListAlbums { query, offset },
-            _ => AppCommand::BrowseLibrary {
+            (LibraryTab::Folders, None) => {
+                AppCommand::Library(LibraryCommand::ListFolders { query, offset })
+            }
+            (LibraryTab::Albums, None) => {
+                AppCommand::Library(LibraryCommand::ListAlbums { query, offset })
+            }
+            _ => AppCommand::Library(LibraryCommand::BrowseLibrary {
                 filter: self.group.clone().unwrap_or_default(),
                 query,
                 offset,
-            },
+            }),
         };
         self.submit(command);
     }
     pub(super) fn open_group(&mut self, filter: LibraryFilter) {
-        if self.submit(AppCommand::BrowseLibrary {
+        if self.submit(LibraryCommand::BrowseLibrary {
             filter: filter.clone(),
             query: String::new(),
             offset: 0,
@@ -137,19 +141,19 @@ impl PlayerApp {
                         LibraryTab::Albums => state.albums.query.clone(),
                     };
                     let command = match tab {
-                        LibraryTab::Tracks => AppCommand::BrowseLibrary {
+                        LibraryTab::Tracks => AppCommand::Library(LibraryCommand::BrowseLibrary {
                             filter: LibraryFilter::All,
                             query: query.clone(),
                             offset: 0,
-                        },
-                        LibraryTab::Folders => AppCommand::ListFolders {
+                        }),
+                        LibraryTab::Folders => AppCommand::Library(LibraryCommand::ListFolders {
                             query: query.clone(),
                             offset: 0,
-                        },
-                        LibraryTab::Albums => AppCommand::ListAlbums {
+                        }),
+                        LibraryTab::Albums => AppCommand::Library(LibraryCommand::ListAlbums {
                             query: query.clone(),
                             offset: 0,
-                        },
+                        }),
                     };
                     if self.submit(command) {
                         self.tab = tab;
@@ -463,7 +467,7 @@ impl PlayerApp {
             },
             |index| state.queue_index == Some(index),
         );
-        let enabled = !track.missing && self.available();
+        let enabled = !track.missing && self.playback_available();
         let rect = list_rows::allocate(ui, index, active);
         let content = rect.shrink(7.0);
         let button_rect = egui::Rect::from_center_size(
@@ -571,7 +575,11 @@ impl PlayerApp {
             } else {
                 icon_buttons::Icon::Remove
             },
-            self.available() && (!matches!(action, TrackAction::Add) || !track.missing),
+            (if matches!(action, TrackAction::RemovePlaylist(_)) {
+                self.available()
+            } else {
+                self.playback_available()
+            }) && (!matches!(action, TrackAction::Add) || !track.missing),
             match action {
                 TrackAction::Add => "Add to queue",
                 TrackAction::RemoveQueue(_) => "Remove from queue",
@@ -582,9 +590,13 @@ impl PlayerApp {
         self.queue_buttons.push(button.rect);
         if button.clicked() {
             self.submit(match action {
-                TrackAction::Add => AppCommand::Enqueue(track.clone()),
-                TrackAction::RemoveQueue(index) => AppCommand::RemoveQueue(index),
-                TrackAction::RemovePlaylist(id) => AppCommand::RemovePlaylistEntry(id),
+                TrackAction::Add => AppCommand::Playback(PlaybackCommand::Enqueue(track.clone())),
+                TrackAction::RemoveQueue(index) => {
+                    AppCommand::Playback(PlaybackCommand::RemoveQueue(index))
+                }
+                TrackAction::RemovePlaylist(id) => {
+                    AppCommand::Library(LibraryCommand::RemovePlaylistEntry(id))
+                }
             });
         }
         let response = ui
@@ -618,28 +630,29 @@ impl PlayerApp {
             egui::WidgetInfo::labeled(egui::Role::Button, enabled, track_title(track))
         });
         if enabled && response.double_clicked() {
-            self.submit(
-                queue_index.map_or_else(|| AppCommand::Play(track.clone()), AppCommand::PlayQueue),
-            );
+            self.submit(queue_index.map_or_else(
+                || AppCommand::Playback(PlaybackCommand::Play(track.clone())),
+                |value| AppCommand::Playback(PlaybackCommand::PlayQueue(value)),
+            ));
         }
         response.context_menu(|ui| {
             if ui
                 .add_enabled(enabled, egui::Button::new("Add to queue"))
                 .clicked()
             {
-                self.submit(AppCommand::Enqueue(track.clone()));
+                self.submit(PlaybackCommand::Enqueue(track.clone()));
                 ui.close();
             }
             if let Some(index) = queue_index
                 && ui.button("Remove from queue").clicked()
             {
-                self.submit(AppCommand::RemoveQueue(index));
+                self.submit(PlaybackCommand::RemoveQueue(index));
                 ui.close();
             }
             if let TrackAction::RemovePlaylist(id) = action
                 && ui.button("Remove from playlist").clicked()
             {
-                self.submit(AppCommand::RemovePlaylistEntry(id));
+                self.submit(LibraryCommand::RemovePlaylistEntry(id));
                 ui.close();
             }
             if !state.playlists.is_empty() {
@@ -648,7 +661,7 @@ impl PlayerApp {
             }
             for playlist in &state.playlists {
                 if ui.button(&playlist.name).clicked() {
-                    self.submit(AppCommand::AddToPlaylist {
+                    self.submit(LibraryCommand::AddToPlaylist {
                         playlist_id: playlist.id,
                         track_id: track.id,
                     });
@@ -673,7 +686,7 @@ impl PlayerApp {
                 let clear = icon_buttons::icon_buttons(
                     ui,
                     icon_buttons::Icon::ClearAll,
-                    self.available() && !state.queue.is_empty(),
+                    self.playback_available() && !state.queue.is_empty(),
                     "Clear queue",
                 );
                 #[cfg(test)]
@@ -681,7 +694,7 @@ impl PlayerApp {
                     self.clear_button = Some(clear.rect);
                 }
                 if clear.clicked() {
-                    self.submit(AppCommand::ClearQueue);
+                    self.submit(PlaybackCommand::ClearQueue);
                 }
             });
         });

@@ -155,7 +155,7 @@ impl PlayerApp {
             #[cfg(test)]
             self.folder_actions.push([expand.rect, rescan.rect]);
             if rescan.clicked() {
-                self.submit(AppCommand::RescanFolder(folder.id));
+                self.submit(LibraryCommand::RescanFolder(folder.id));
             }
             details.show_body_unindented(ui, |ui| {
                 egui::Frame::new().inner_margin(8).show(ui, |ui| {

@@ -71,12 +71,7 @@ async fn dac_playback_diagnostics() {
         assert_eq!(matching.len(), 1, "Choose one device from {devices:?}");
         matching[0].id.clone()
     });
-    let mut worker = Worker::with_devices(
-        sender,
-        Arc::new(|| {}),
-        Arc::new(AtomicBool::new(false)),
-        devices,
-    );
+    let mut worker = Worker::with_devices(sender, Arc::new(AtomicBool::new(false)), devices);
     worker.device_updates = device_updates;
     worker.selected_device = selected;
     worker.snapshot.volume = 0.0;
@@ -204,12 +199,7 @@ fn worker_at_rate(
     channels: usize,
 ) -> (Worker, ringbuf::HeapCons<f64>, Arc<output::CallbackState>) {
     let (sender, _) = watch::channel(PlaybackSnapshot::default());
-    let mut worker = Worker::with_devices(
-        sender,
-        Arc::new(|| {}),
-        Arc::new(AtomicBool::new(false)),
-        Vec::new(),
-    );
+    let mut worker = Worker::with_devices(sender, Arc::new(AtomicBool::new(false)), Vec::new());
     let (output, consumer) = Output::fake(rate, channels);
     let state = output.state.clone();
     let session = Session::new(Prepared::open(track).unwrap(), rate, channels).unwrap();
@@ -300,65 +290,92 @@ fn dsd_file_callback_correctness() {
     }
 }
 
-#[test]
-fn paused_worker_stays_quiet_and_still_reports_commands_progress_and_device_events() {
+#[tokio::test]
+async fn paused_worker_stays_quiet_and_still_reports_commands_progress_and_device_events() {
     let (_fixture, track) = fixture(1, 8192);
-    let (sender, snapshots) = watch::channel(PlaybackSnapshot::default());
+    let (sender, mut snapshots) = watch::channel(PlaybackSnapshot::default());
     let (commands, receiver) = mpsc::sync_channel(4);
-    let (wakes, wakeups) = mpsc::channel();
     let (output, callbacks) = mpsc::channel();
     let thread = thread::spawn(move || {
         let (mut worker, consumer, state) = worker(track, None);
         worker.sender = sender;
-        worker.wake = Arc::new(move || {
-            let _ = wakes.send(());
-        });
         worker.command(AudioCommand::Pause).unwrap();
         output.send((consumer, state)).unwrap();
         worker.run(receiver);
     });
     let (mut consumer, state) = callbacks.recv_timeout(Duration::from_secs(3)).unwrap();
-    wakeups.recv_timeout(Duration::from_secs(3)).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), snapshots.changed())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(snapshots.borrow().state, PlaybackState::Paused);
-    assert_eq!(
-        wakeups.recv_timeout(Duration::from_millis(250)),
-        Err(mpsc::RecvTimeoutError::Timeout),
-        "unchanged paused playback must not repaint"
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), snapshots.changed())
+            .await
+            .is_err(),
+        "unchanged paused playback must not publish"
     );
 
-    commands.send(AudioCommand::SetVolume(0.5)).unwrap();
-    wakeups.recv_timeout(Duration::from_secs(3)).unwrap();
+    commands
+        .send(TraceContext::new(&"test").wrap(AudioCommand::SetVolume(0.5)))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), snapshots.changed())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(snapshots.borrow().volume, 0.5);
 
     state.device_underruns.fetch_add(1, Ordering::Relaxed);
-    wakeups.recv_timeout(Duration::from_secs(3)).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), snapshots.changed())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(snapshots.borrow().underruns, 1);
-    assert_eq!(
-        wakeups.recv_timeout(Duration::from_millis(250)),
-        Err(mpsc::RecvTimeoutError::Timeout)
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), snapshots.changed())
+            .await
+            .is_err()
     );
 
-    commands.send(AudioCommand::Resume).unwrap();
-    wakeups.recv_timeout(Duration::from_secs(3)).unwrap();
+    commands
+        .send(TraceContext::new(&"test").wrap(AudioCommand::Resume))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), snapshots.changed())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(snapshots.borrow().state, PlaybackState::Playing);
     let mut rendered = [0.0_f64; 800];
     output::test_consume(&mut consumer, &mut rendered, 1, &state);
     assert_eq!(rendered, [0.125; 800]);
-    wakeups.recv_timeout(Duration::from_secs(3)).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), snapshots.changed())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(snapshots.borrow().position_ms, 100);
 
-    commands.send(AudioCommand::Pause).unwrap();
-    wakeups.recv_timeout(Duration::from_secs(3)).unwrap();
+    commands
+        .send(TraceContext::new(&"test").wrap(AudioCommand::Pause))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), snapshots.changed())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(snapshots.borrow().state, PlaybackState::Paused);
     state.failed.store(true, Ordering::Relaxed);
-    wakeups.recv_timeout(Duration::from_secs(3)).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), snapshots.changed())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(snapshots.borrow().position_ms, 100);
     assert_eq!(
         snapshots.borrow().notification.as_deref(),
         Some("Audio output device changed. Playback paused.")
     );
 
-    commands.send(AudioCommand::Shutdown).unwrap();
+    commands
+        .send(TraceContext::new(&"test").wrap(AudioCommand::Shutdown))
+        .unwrap();
     thread.join().unwrap();
 }
 
@@ -399,18 +416,9 @@ fn periodic_diagnostics_reset_measurements_without_changing_playback() {
 }
 
 #[test]
-fn device_updates_publish_only_the_latest_list_and_wake() {
+fn device_updates_publish_only_the_latest_list() {
     let (sender, mut snapshots) = watch::channel(PlaybackSnapshot::default());
-    let wakes = Arc::new(AtomicU64::new(0));
-    let wake_count = wakes.clone();
-    let mut worker = Worker::with_devices(
-        sender,
-        Arc::new(move || {
-            wake_count.fetch_add(1, Ordering::Relaxed);
-        }),
-        Arc::new(AtomicBool::new(false)),
-        Vec::new(),
-    );
+    let mut worker = Worker::with_devices(sender, Arc::new(AtomicBool::new(false)), Vec::new());
     let (devices, updates) = watch::channel(Vec::new());
     worker.device_updates = updates;
     devices.send(vec!["Old output".into()]).unwrap();
@@ -423,29 +431,19 @@ fn device_updates_publish_only_the_latest_list_and_wake() {
     assert!(snapshots.has_changed().unwrap());
     assert_eq!(snapshots.borrow_and_update().devices, latest);
     assert!(!worker.device_updates.has_changed().unwrap());
-    assert_eq!(wakes.load(Ordering::Relaxed), 1);
 }
 
 #[test]
-fn unchanged_device_updates_do_not_publish_or_wake() {
+fn unchanged_device_updates_do_not_publish() {
     let initial = vec!["Headphones".into()];
     let (sender, mut snapshots) = watch::channel(PlaybackSnapshot::default());
-    let wakes = Arc::new(AtomicU64::new(0));
-    let wake_count = wakes.clone();
-    let mut worker = Worker::with_devices(
-        sender,
-        Arc::new(move || {
-            wake_count.fetch_add(1, Ordering::Relaxed);
-        }),
-        Arc::new(AtomicBool::new(false)),
-        initial.clone(),
-    );
+    let mut worker =
+        Worker::with_devices(sender, Arc::new(AtomicBool::new(false)), initial.clone());
     let (devices, updates) = watch::channel(initial.clone());
     worker.device_updates = updates;
     worker.publish();
     snapshots.borrow_and_update();
     let last_publish = worker.last_publish;
-    let wake_count = wakes.load(Ordering::Relaxed);
 
     worker.refresh_devices();
     for _ in 0..2 {
@@ -458,18 +456,12 @@ fn unchanged_device_updates_do_not_publish_or_wake() {
     assert_eq!(worker.snapshot.devices, initial);
     assert!(!snapshots.has_changed().unwrap());
     assert_eq!(worker.last_publish, last_publish);
-    assert_eq!(wakes.load(Ordering::Relaxed), wake_count);
 }
 
 #[test]
 fn closed_device_updates_publish_the_latest_list() {
     let (sender, mut snapshots) = watch::channel(PlaybackSnapshot::default());
-    let mut worker = Worker::with_devices(
-        sender,
-        Arc::new(|| {}),
-        Arc::new(AtomicBool::new(false)),
-        Vec::new(),
-    );
+    let mut worker = Worker::with_devices(sender, Arc::new(AtomicBool::new(false)), Vec::new());
     let latest = vec!["Replacement output".into()];
 
     update_devices(&mut worker, latest.clone());
@@ -700,12 +692,7 @@ fn dsd_load_and_seek_negotiate_pcm_and_resample_for_device_fallback() {
         segment: None,
     };
     let (sender, _) = watch::channel(PlaybackSnapshot::default());
-    let mut worker = Worker::with_devices(
-        sender,
-        Arc::new(|| {}),
-        Arc::new(AtomicBool::new(false)),
-        Vec::new(),
-    );
+    let mut worker = Worker::with_devices(sender, Arc::new(AtomicBool::new(false)), Vec::new());
     worker.output_factory = Some(|rate, channels, format, rate_selection, selected, volume| {
         assert_eq!(rate, dsd::PCM_RATE);
         assert_eq!(channels, 2);
@@ -754,12 +741,7 @@ fn dsd_load_and_paused_seek_resample_to_384000_with_i32_output() {
         segment: None,
     };
     let (sender, _) = watch::channel(PlaybackSnapshot::default());
-    let mut worker = Worker::with_devices(
-        sender,
-        Arc::new(|| {}),
-        Arc::new(AtomicBool::new(false)),
-        Vec::new(),
-    );
+    let mut worker = Worker::with_devices(sender, Arc::new(AtomicBool::new(false)), Vec::new());
     worker.output_factory = Some(|rate, channels, format, rate_selection, selected, volume| {
         assert_eq!(rate, dsd::PCM_RATE);
         assert_eq!(channels, 2);
@@ -875,12 +857,7 @@ fn mixed_dsd_pcm_policies_drain_and_reopen_even_with_identical_decoded_pcm() {
         let second_policy = second.rate_selection();
         let second_id = second.track.id;
         let (sender, _) = watch::channel(PlaybackSnapshot::default());
-        let mut worker = Worker::with_devices(
-            sender,
-            Arc::new(|| {}),
-            Arc::new(AtomicBool::new(false)),
-            Vec::new(),
-        );
+        let mut worker = Worker::with_devices(sender, Arc::new(AtomicBool::new(false)), Vec::new());
         worker.output_factory = Some(|rate, channels, format, policy, selected, volume| {
             assert_eq!(rate, 176_400);
             assert_eq!(format, PcmFormat::Float(64));
@@ -1095,12 +1072,7 @@ fn mixed_precision_tracks_reuse_or_drain_and_reopen_the_stream() {
 fn precision_reducing_output_falls_back_without_stopping_playback() {
     let (_fixture, track) = fixture_pcm(1, 0x4000_0001, 32, 1000);
     let (sender, _) = watch::channel(PlaybackSnapshot::default());
-    let mut worker = Worker::with_devices(
-        sender,
-        Arc::new(|| {}),
-        Arc::new(AtomicBool::new(false)),
-        Vec::new(),
-    );
+    let mut worker = Worker::with_devices(sender, Arc::new(AtomicBool::new(false)), Vec::new());
     worker.output_factory = Some(|rate, channels, format, rate_selection, selected, volume| {
         assert_eq!(rate_selection, RateSelection::Native);
         let mut output = recovery_output(rate, channels, format, rate_selection, selected, volume)?;

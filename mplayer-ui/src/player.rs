@@ -113,7 +113,7 @@ impl PlayerApp {
 
     pub(super) fn seek_to(&mut self, position_ms: u64) {
         let request_id = self.seek_request_id.wrapping_add(1).max(1);
-        if self.submit(AppCommand::Seek {
+        if self.submit(PlaybackCommand::Seek {
             position_ms,
             request_id,
         }) {
@@ -167,13 +167,14 @@ impl PlayerApp {
             }
             let width = (ui.available_width() - 28.0 - ui.spacing().item_spacing.x).max(0.0);
             let volume_slider =
-                player_slider(ui, &mut volume, 1.0, width, self.available()).on_hover_text(tooltip);
+                player_slider(ui, &mut volume, 1.0, width, self.playback_available())
+                    .on_hover_text(tooltip);
             #[cfg(test)]
             {
                 self.volume_slider = Some(volume_slider.rect);
             }
             if volume_slider.changed() {
-                self.submit(AppCommand::SetVolume(volume as f32));
+                self.submit(PlaybackCommand::SetVolume(volume as f32));
             }
             // Keep device selection available when the current output has failed.
             let selected = playback
@@ -183,7 +184,7 @@ impl PlayerApp {
             let audio_output_button = icon_buttons::icon_buttons(
                 ui,
                 icon_buttons::Icon::AudioOutput,
-                self.available(),
+                self.playback_available(),
                 &format!("Output device: {selected}"),
             );
             #[cfg(test)]
@@ -231,7 +232,7 @@ impl PlayerApp {
                             .selectable_label(playback.selected_device.is_none(), "System default")
                             .clicked()
                         {
-                            self.submit(AppCommand::SetDevice(None));
+                            self.submit(PlaybackCommand::SetDevice(None));
                             ui.close();
                         }
                         for (device, label) in playback.devices.iter().zip(labels) {
@@ -243,7 +244,7 @@ impl PlayerApp {
                                 .on_hover_text(&device.id)
                                 .clicked()
                             {
-                                self.submit(AppCommand::SetDevice(Some(device.id.clone())));
+                                self.submit(PlaybackCommand::SetDevice(Some(device.id.clone())));
                                 ui.close();
                             }
                         }
@@ -435,7 +436,7 @@ impl PlayerApp {
                 &mut position,
                 duration,
                 ui.available_width(),
-                self.available() && playback.track.is_some() && playback.duration_ms > 0,
+                self.playback_available() && playback.track.is_some() && playback.duration_ms > 0,
             );
             #[cfg(test)]
             {
@@ -452,7 +453,7 @@ impl PlayerApp {
         let controls = ui.horizontal_centered(|ui| {
             let total = 28.0 * 2.0 + 39.0 * 2.0 + 56.0 + ui.spacing().item_spacing.x * 4.0;
             ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
-            let available = self.available();
+            let available = self.playback_available();
             let (icon, label, next_mode) = match state.play_mode {
                 PlayMode::Sequential => (
                     icon_buttons::Icon::Sequential,
@@ -476,7 +477,7 @@ impl PlayerApp {
                 self.mode_button = Some(mode.rect);
             }
             if mode.clicked() {
-                self.submit(AppCommand::SetPlayMode(next_mode));
+                self.submit(PlaybackCommand::SetPlayMode(next_mode));
             }
             let previous = icon_buttons::icon_buttons(
                 ui,
@@ -489,7 +490,7 @@ impl PlayerApp {
                 self.transport_buttons[0] = Some(previous.rect);
             }
             if previous.clicked() {
-                self.submit(AppCommand::Previous);
+                self.submit(PlaybackCommand::Previous);
             }
             let playing = matches!(
                 playback.state,
@@ -510,7 +511,7 @@ impl PlayerApp {
                 self.transport_buttons[1] = Some(play.rect);
             }
             if play.clicked() {
-                self.submit(AppCommand::PauseResume);
+                self.submit(PlaybackCommand::PauseResume);
             }
             let next = icon_buttons::icon_buttons(
                 ui,
@@ -526,7 +527,7 @@ impl PlayerApp {
                 self.transport_buttons[2] = Some(next.rect);
             }
             if next.clicked() {
-                self.submit(AppCommand::Next);
+                self.submit(PlaybackCommand::Next);
             }
 
             let queue =

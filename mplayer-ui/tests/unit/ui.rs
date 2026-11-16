@@ -1,8 +1,10 @@
+mod services;
 use super::*;
 use mplayer_core::{
     AlbumKey, AlbumPage, AlbumSummary, FolderPage, FolderSummary, LibraryPage, PlaybackSnapshot,
     Playlist, PlaylistEntry, TrackMetadata,
 };
+use services::*;
 use std::path::PathBuf;
 
 fn track(id: i64) -> Track {
@@ -180,8 +182,8 @@ fn all_views_and_library_tabs_render_at_both_window_sizes() {
                 View::Playlists,
             ] {
                 for tab in [LibraryTab::Tracks, LibraryTab::Folders, LibraryTab::Albums] {
-                    let (sender, _receiver) = mpsc::channel(64);
-                    let (_state, snapshots) = watch::channel(populated());
+                    let (sender, _receiver) = command_channel(64);
+                    let (_state, snapshots) = snapshot_channel(populated());
                     let mut app = PlayerApp::new(sender, snapshots);
                     app.view = view;
                     app.tab = tab;
@@ -266,8 +268,8 @@ fn system_theme_changes_update_panels_text_and_custom_controls_without_restart()
             _ => (),
         }
     }
-    let (sender, _receiver) = mpsc::channel(64);
-    let (_state, snapshots) = watch::channel(populated());
+    let (sender, _receiver) = command_channel(64);
+    let (_state, snapshots) = snapshot_channel(populated());
     let mut app = PlayerApp::new(sender, snapshots);
     let context = egui::Context::default();
     for system_theme in [egui::Theme::Light, egui::Theme::Dark, egui::Theme::Light] {
@@ -323,13 +325,13 @@ fn system_theme_changes_update_panels_text_and_custom_controls_without_restart()
 fn album_detail_header_replaces_search_and_keeps_tracks_below_artwork() {
     for size in [[950.0, 620.0], [1150.0, 760.0]] {
         for year in [None, Some(2026)] {
-            let (sender, mut receiver) = mpsc::channel(64);
+            let (sender, mut receiver) = command_channel(64);
             let mut snapshot = populated();
             let key = snapshot.albums.albums[0].key.clone();
             Arc::make_mut(&mut snapshot.albums.albums)[0].year = year;
             snapshot.library_filter = LibraryFilter::Album(key.clone());
             snapshot.albums.query = "previous search".into();
-            let (_state, snapshots) = watch::channel(snapshot);
+            let (_state, snapshots) = snapshot_channel(snapshot);
             let mut app = PlayerApp::new(sender, snapshots);
             app.tab = LibraryTab::Albums;
             app.group = Some(LibraryFilter::Album(key.clone()));
@@ -377,12 +379,12 @@ fn album_detail_header_replaces_search_and_keeps_tracks_below_artwork() {
 
 #[test]
 fn album_header_does_not_reuse_metadata_from_a_previous_album_while_loading() {
-    let (sender, _receiver) = mpsc::channel(64);
+    let (sender, _receiver) = command_channel(64);
     let mut snapshot = populated();
     for track in Arc::make_mut(&mut snapshot.library.tracks) {
         track.metadata.year = Some(1999);
     }
-    let (_state, snapshots) = watch::channel(snapshot);
+    let (_state, snapshots) = snapshot_channel(snapshot);
     let mut app = PlayerApp::new(sender, snapshots);
     app.tab = LibraryTab::Albums;
     app.group = Some(LibraryFilter::Album(AlbumKey {
@@ -401,8 +403,8 @@ fn album_header_does_not_reuse_metadata_from_a_previous_album_while_loading() {
 
 #[test]
 fn clear_search_icon_dispatches_an_empty_query_and_disables_when_empty() {
-    let (sender, mut receiver) = mpsc::channel(64);
-    let (_state, snapshots) = watch::channel(populated());
+    let (sender, mut receiver) = command_channel(64);
+    let (_state, snapshots) = snapshot_channel(populated());
     let mut app = PlayerApp::new(sender, snapshots);
     app.tab = LibraryTab::Albums;
     app.search = "Draconian".into();
@@ -413,7 +415,7 @@ fn clear_search_icon_dispatches_an_empty_query_and_disables_when_empty() {
     click_at(&mut app, &context, [1150.0, 760.0], position);
     assert!(app.search.is_empty());
     assert!(
-        matches!(receiver.try_recv(), Ok(AppCommand::ListAlbums { query, offset: 0 }) if query.is_empty())
+        matches!(receiver.try_recv(), Ok(AppCommand::Library(LibraryCommand::ListAlbums { query, offset: 0 })) if query.is_empty())
     );
     click_at(&mut app, &context, [1150.0, 760.0], position);
     assert!(receiver.try_recv().is_err());
@@ -421,20 +423,23 @@ fn clear_search_icon_dispatches_an_empty_query_and_disables_when_empty() {
 
 #[test]
 fn library_tabs_dispatch_group_queries_and_folder_drilldown() {
-    let (sender, mut receiver) = mpsc::channel(64);
-    let (_state, snapshots) = watch::channel(populated());
+    let (sender, mut receiver) = command_channel(64);
+    let (_state, snapshots) = snapshot_channel(populated());
     let mut app = PlayerApp::new(sender, snapshots);
     let context = egui::Context::default();
     click(&mut app, &context, "Folders");
     assert_eq!(app.tab, LibraryTab::Folders);
     assert!(matches!(
         receiver.try_recv(),
-        Ok(AppCommand::ListFolders { offset: 0, .. })
+        Ok(AppCommand::Library(LibraryCommand::ListFolders {
+            offset: 0,
+            ..
+        }))
     ));
     click(&mut app, &context, "Album");
     let command = receiver.try_recv();
     assert!(
-        matches!(&command,Ok(AppCommand::BrowseLibrary{filter:LibraryFilter::Folder(path),..}) if path==&PathBuf::from("/music/Album")),
+        matches!(&command,Ok(AppCommand::Library(LibraryCommand::BrowseLibrary{filter:LibraryFilter::Folder(path),..})) if path==&PathBuf::from("/music/Album")),
         "folder action: {command:?}, selected: {:?}",
         app.group
     );
@@ -443,7 +448,10 @@ fn library_tabs_dispatch_group_queries_and_folder_drilldown() {
     assert_eq!(app.tab, LibraryTab::Albums);
     assert!(matches!(
         receiver.try_recv(),
-        Ok(AppCommand::ListAlbums { offset: 0, .. })
+        Ok(AppCommand::Library(LibraryCommand::ListAlbums {
+            offset: 0,
+            ..
+        }))
     ));
 }
 
@@ -453,8 +461,8 @@ fn disconnected_output_shows_notification_instead_of_playback_error() {
     snapshot.playback.state = PlaybackState::Paused;
     let notification = "Audio output device changed. Playback paused.";
     snapshot.playback.notification = Some(notification.into());
-    let (sender, _receiver) = mpsc::channel(64);
-    let (_state, snapshots) = watch::channel(snapshot);
+    let (sender, _receiver) = command_channel(64);
+    let (_state, snapshots) = snapshot_channel(snapshot);
     let mut app = PlayerApp::new(sender, snapshots);
     let context = egui::Context::default();
     let output = frame(&mut app, &context, [1150.0, 760.0], Vec::new());
@@ -475,8 +483,8 @@ fn playback_messages_stay_above_controls_without_moving_player_content() {
         let mut snapshot = populated();
         let title = "Now playing title";
         snapshot.playback.track.as_mut().unwrap().metadata.title = title.into();
-        let (sender, _receiver) = mpsc::channel(64);
-        let (state, snapshots) = watch::channel(snapshot);
+        let (sender, _receiver) = command_channel(64);
+        let (state, snapshots) = snapshot_channel(snapshot);
         let mut app = PlayerApp::new(sender, snapshots);
         let context = egui::Context::default();
         let artwork = |output: &egui::FullOutput| {
@@ -576,8 +584,8 @@ fn failed_output_still_allows_selecting_another_device_without_scrolling() {
     snapshot.playback.state = PlaybackState::Error;
     snapshot.playback.error = Some("Device unplugged".into());
     snapshot.playback.selected_device = Some("Failed device".into());
-    let (sender, mut receiver) = mpsc::channel(64);
-    let (_state, snapshots) = watch::channel(snapshot);
+    let (sender, mut receiver) = command_channel(64);
+    let (_state, snapshots) = snapshot_channel(snapshot);
     let mut app = PlayerApp::new(sender, snapshots);
     let context = egui::Context::default();
     frame(&mut app, &context, [1150.0, 760.0], Vec::new());
@@ -593,15 +601,15 @@ fn failed_output_still_allows_selecting_another_device_without_scrolling() {
     );
     click(&mut app, &context, "Working device");
     assert!(
-        matches!(receiver.try_recv(),Ok(AppCommand::SetDevice(Some(name))) if name=="Working device")
+        matches!(receiver.try_recv(),Ok(AppCommand::Playback(PlaybackCommand::SetDevice(Some(name)))) if name=="Working device")
     );
     assert!(!app.outbox.disconnected);
 }
 
 #[test]
 fn final_error_snapshot_is_visible_after_service_shutdown() {
-    let (sender, _receiver) = mpsc::channel(64);
-    let (state, snapshots) = watch::channel(AppSnapshot::default());
+    let (sender, _receiver) = command_channel(64);
+    let (state, snapshots) = snapshot_channel(AppSnapshot::default());
     let mut app = PlayerApp::new(sender, snapshots);
     state.send_replace(AppSnapshot {
         status: "Initialization failed".into(),
@@ -614,36 +622,44 @@ fn final_error_snapshot_is_visible_after_service_shutdown() {
 }
 #[test]
 fn outbox_retries_in_order_and_preserves_discrete_controls() {
-    let (sender, mut receiver) = mpsc::channel(1);
-    sender.try_send(AppCommand::Stop).unwrap();
+    let (sender, mut receiver) = command_channel(1);
+    sender
+        .try_send(sender.prepare(AppCommand::Playback(PlaybackCommand::Stop)))
+        .unwrap();
     let mut outbox = Outbox::default();
-    outbox.push(AppCommand::Next);
-    outbox.push(AppCommand::Seek {
+    outbox.push(sender.prepare(AppCommand::Playback(PlaybackCommand::Next)));
+    outbox.push(sender.prepare(AppCommand::Playback(PlaybackCommand::Seek {
         position_ms: 10,
         request_id: 10,
-    });
-    outbox.push(AppCommand::Seek {
+    })));
+    outbox.push(sender.prepare(AppCommand::Playback(PlaybackCommand::Seek {
         position_ms: 20,
         request_id: 20,
-    });
+    })));
     assert_eq!(outbox.pending.len(), 2);
-    outbox.flush(&sender);
-    assert!(matches!(receiver.try_recv(), Ok(AppCommand::Stop)));
-    outbox.flush(&sender);
-    assert!(matches!(receiver.try_recv(), Ok(AppCommand::Next)));
     outbox.flush(&sender);
     assert!(matches!(
         receiver.try_recv(),
-        Ok(AppCommand::Seek {
+        Ok(AppCommand::Playback(PlaybackCommand::Stop))
+    ));
+    outbox.flush(&sender);
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(AppCommand::Playback(PlaybackCommand::Next))
+    ));
+    outbox.flush(&sender);
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(AppCommand::Playback(PlaybackCommand::Seek {
             position_ms: 20,
             request_id: 20
-        })
+        }))
     ));
     drop(receiver);
-    outbox.push(AppCommand::Stop);
+    outbox.push(sender.prepare(AppCommand::Playback(PlaybackCommand::Stop)));
     outbox.flush(&sender);
     assert!(outbox.disconnected);
-    assert!(!outbox.push(AppCommand::Next));
+    assert!(!outbox.push(sender.prepare(AppCommand::Playback(PlaybackCommand::Next))));
 }
 #[test]
 fn durations_and_missing_titles_have_readable_fallbacks() {
@@ -656,32 +672,43 @@ fn durations_and_missing_titles_have_readable_fallbacks() {
 
 #[test]
 fn filtered_search_coalesces_without_changing_group_when_rejected() {
-    let (sender, _receiver) = mpsc::channel(1);
-    sender.try_send(AppCommand::Stop).unwrap();
-    let (_state, snapshots) = watch::channel(populated());
-    let mut app = PlayerApp::new(sender, snapshots);
+    let (sender, _receiver) = command_channel(1);
+    sender
+        .try_send(sender.prepare(AppCommand::Playback(PlaybackCommand::Stop)))
+        .unwrap();
+    let (_state, snapshots) = snapshot_channel(populated());
+    let mut app = PlayerApp::new(sender.clone(), snapshots);
     let mut outbox = Outbox::default();
-    outbox.push(AppCommand::BrowseLibrary {
-        filter: LibraryFilter::All,
-        query: "a".into(),
-        offset: 0,
-    });
-    outbox.push(AppCommand::BrowseLibrary {
-        filter: LibraryFilter::All,
-        query: "album".into(),
-        offset: 0,
-    });
-    outbox.push(AppCommand::BrowseLibrary {
-        filter: LibraryFilter::Folder("/music".into()),
-        query: "other".into(),
-        offset: 0,
-    });
+    outbox.push(
+        sender.prepare(AppCommand::Library(LibraryCommand::BrowseLibrary {
+            filter: LibraryFilter::All,
+            query: "a".into(),
+            offset: 0,
+        })),
+    );
+    outbox.push(
+        sender.prepare(AppCommand::Library(LibraryCommand::BrowseLibrary {
+            filter: LibraryFilter::All,
+            query: "album".into(),
+            offset: 0,
+        })),
+    );
+    outbox.push(
+        sender.prepare(AppCommand::Library(LibraryCommand::BrowseLibrary {
+            filter: LibraryFilter::Folder("/music".into()),
+            query: "other".into(),
+            offset: 0,
+        })),
+    );
     assert_eq!(outbox.pending.len(), 2);
     assert!(
-        matches!(outbox.pending.front(), Some(AppCommand::BrowseLibrary { query, .. }) if query == "album")
+        matches!(outbox.pending.front().map(|command| &command.payload), Some(AppCommand::Library(LibraryCommand::BrowseLibrary { query, .. })) if query == "album")
     );
     for _ in 0..MAX_PENDING {
-        app.outbox.push(AppCommand::Next);
+        app.library_outbox.push(
+            app.commands
+                .prepare(LibraryCommand::CreatePlaylist("pending".into())),
+        );
     }
     app.open_group(LibraryFilter::Folder("/new-folder".into()));
     assert!(app.group.is_none());
@@ -693,8 +720,8 @@ fn native_folder_action_remains_available_while_scanning() {
     let mut snapshot = populated();
     snapshot.roots.clear();
     snapshot.scan.running = true;
-    let (sender, mut receiver) = mpsc::channel(64);
-    let (_state, snapshots) = watch::channel(snapshot);
+    let (sender, mut receiver) = command_channel(64);
+    let (_state, snapshots) = snapshot_channel(snapshot);
     let mut app = PlayerApp::new(sender, snapshots);
     let context = egui::Context::default();
     click(&mut app, &context, "Scan folders");
@@ -707,15 +734,17 @@ fn native_folder_action_remains_available_while_scanning() {
     ];
     app.folders.complete_for_test(roots.clone());
     frame(&mut app, &context, [1150.0, 760.0], Vec::new());
-    assert!(matches!(receiver.try_recv(),Ok(AppCommand::Import(paths)) if paths==roots));
+    assert!(
+        matches!(receiver.try_recv(),Ok(AppCommand::Library(LibraryCommand::Import(paths))) if paths==roots)
+    );
     assert!(!app.folders.is_open());
     assert_eq!(app.view, View::ScanFolders);
 }
 
 #[test]
 fn sidebar_contains_only_three_tabs_and_queue_is_available_from_player() {
-    let (sender, _receiver) = mpsc::channel(64);
-    let (_state, snapshots) = watch::channel(populated());
+    let (sender, _receiver) = command_channel(64);
+    let (_state, snapshots) = snapshot_channel(populated());
     let mut app = PlayerApp::new(sender, snapshots);
     let context = egui::Context::default();
     frame(&mut app, &context, [1150.0, 760.0], Vec::new());
@@ -754,8 +783,8 @@ fn scan_folder_rows_are_passive_and_actions_work_with_a_long_list() {
             .map(|index| PathBuf::from(format!("/music/{index:03}")))
             .collect();
         let selected = snapshot.roots[0].clone();
-        let (sender, mut receiver) = mpsc::channel(64);
-        let (state, snapshots) = watch::channel(snapshot.clone());
+        let (sender, mut receiver) = command_channel(64);
+        let (state, snapshots) = snapshot_channel(snapshot.clone());
         let mut app = PlayerApp::new(sender, snapshots);
         app.view = View::ScanFolders;
         let context = egui::Context::default();
@@ -781,11 +810,14 @@ fn scan_folder_rows_are_passive_and_actions_work_with_a_long_list() {
         frame(&mut app, &context, size, Vec::new());
         click_at(&mut app, &context, size, remove.center());
         assert!(
-            matches!(receiver.try_recv(), Ok(AppCommand::RemoveScanFolder(path)) if path == selected)
+            matches!(receiver.try_recv(), Ok(AppCommand::Library(LibraryCommand::RemoveScanFolder(path))) if path == selected)
         );
         let rescan = app.scan_actions[1].unwrap().center();
         click_at(&mut app, &context, size, rescan);
-        assert!(matches!(receiver.try_recv(), Ok(AppCommand::Rescan)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AppCommand::Library(LibraryCommand::Rescan))
+        ));
         snapshot.scan.running = true;
         state.send_replace(snapshot);
         frame(&mut app, &context, size, Vec::new());
@@ -796,7 +828,10 @@ fn scan_folder_rows_are_passive_and_actions_work_with_a_long_list() {
             "removal and rescan are disabled while scanning"
         );
         click(&mut app, &context, "Cancel");
-        assert!(matches!(receiver.try_recv(), Ok(AppCommand::CancelScan)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AppCommand::Library(LibraryCommand::CancelScan))
+        ));
     }
 }
 
@@ -817,8 +852,8 @@ async fn embedded_artwork_is_uploaded_and_drawn_in_the_now_playing_panel() {
         data: encoded.into(),
         mime_type: "image/png".into(),
     });
-    let (sender, _receiver) = mpsc::channel(64);
-    let (_state, snapshots) = watch::channel(snapshot);
+    let (sender, _receiver) = command_channel(64);
+    let (_state, snapshots) = snapshot_channel(snapshot);
     let mut app = PlayerApp::new(sender, snapshots);
     let context = egui::Context::default();
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -837,13 +872,13 @@ async fn embedded_artwork_is_uploaded_and_drawn_in_the_now_playing_panel() {
 
 #[test]
 fn seek_preview_waits_for_its_acknowledgement_and_tracks_dragging() {
-    let (sender, mut receiver) = mpsc::channel(64);
-    let (state, snapshots) = watch::channel(populated());
+    let (sender, mut receiver) = command_channel(64);
+    let (state, snapshots) = snapshot_channel(populated());
     let mut app = PlayerApp::new(sender, snapshots);
     let context = egui::Context::default();
     app.seek_to(60_000);
     let first_id = match receiver.try_recv().unwrap() {
-        AppCommand::Seek { request_id, .. } => request_id,
+        AppCommand::Playback(PlaybackCommand::Seek { request_id, .. }) => request_id,
         command => panic!("expected seek: {command:?}"),
     };
     state.send_modify(|snapshot| snapshot.playback.position_ms = 1000);
@@ -851,7 +886,7 @@ fn seek_preview_waits_for_its_acknowledgement_and_tracks_dragging() {
     assert_eq!(app.displayed_position(&app.snapshot.playback), 60_000.0);
     app.seek_to(120_000);
     let second_id = match receiver.try_recv().unwrap() {
-        AppCommand::Seek { request_id, .. } => request_id,
+        AppCommand::Playback(PlaybackCommand::Seek { request_id, .. }) => request_id,
         command => panic!("expected seek: {command:?}"),
     };
     assert_ne!(first_id, second_id);
@@ -876,8 +911,8 @@ fn seek_preview_waits_for_its_acknowledgement_and_tracks_dragging() {
 #[test]
 fn pending_seek_clears_on_cue_track_changes_errors_and_disconnection() {
     for change in 0..5 {
-        let (sender, _receiver) = mpsc::channel(64);
-        let (state, snapshots) = watch::channel(populated());
+        let (sender, _receiver) = command_channel(64);
+        let (state, snapshots) = snapshot_channel(populated());
         let mut app = PlayerApp::new(sender, snapshots);
         app.seek_to(60_000);
         app.seek_draft = Some(80_000.0);
@@ -899,12 +934,19 @@ fn pending_seek_clears_on_cue_track_changes_errors_and_disconnection() {
 
 #[test]
 fn rejected_seek_does_not_leave_an_unconfirmed_preview() {
-    let (sender, _receiver) = mpsc::channel(1);
-    sender.try_send(AppCommand::Stop).unwrap();
-    let (_state, snapshots) = watch::channel(populated());
+    let (sender, _receiver) = command_channel(1);
+    sender
+        .try_send(sender.prepare(AppCommand::Playback(PlaybackCommand::Stop)))
+        .unwrap();
+    let (_state, snapshots) = snapshot_channel(populated());
     let mut app = PlayerApp::new(sender, snapshots);
     for _ in 0..MAX_PENDING {
-        assert!(app.outbox.push(AppCommand::Next));
+        assert!(
+            app.outbox.push(
+                app.commands
+                    .prepare(AppCommand::Playback(PlaybackCommand::Next))
+            )
+        );
     }
     app.seek_draft = Some(60_000.0);
     app.seek_to(60_000);
@@ -917,8 +959,8 @@ fn rejected_seek_does_not_leave_an_unconfirmed_preview() {
 fn output_controls_are_symmetric_and_volume_matches_the_seek_slider() {
     for size in [[950.0, 620.0], [1150.0, 760.0]] {
         for system_theme in [egui::Theme::Light, egui::Theme::Dark] {
-            let (sender, mut receiver) = mpsc::channel(64);
-            let (_state, snapshots) = watch::channel(populated());
+            let (sender, mut receiver) = command_channel(64);
+            let (_state, snapshots) = snapshot_channel(populated());
             let mut app = PlayerApp::new(sender, snapshots);
             let context = egui::Context::default();
             let mut initial = context.run_ui(
@@ -948,7 +990,7 @@ fn output_controls_are_symmetric_and_volume_matches_the_seek_slider() {
             click_at(&mut app, &context, size, volume.center());
             let commands: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
             assert!(!commands.is_empty());
-            assert!(commands.iter().all(|command| matches!(command, AppCommand::SetVolume(volume) if (0.45..0.55).contains(volume))));
+            assert!(commands.iter().all(|command| matches!(command, AppCommand::Playback(PlaybackCommand::SetVolume(volume)) if (0.45..0.55).contains(volume))));
         }
     }
 }
@@ -956,8 +998,8 @@ fn output_controls_are_symmetric_and_volume_matches_the_seek_slider() {
 #[test]
 fn clicking_seek_keeps_the_slider_and_time_at_the_requested_position() {
     let size = [1150.0, 760.0];
-    let (sender, mut receiver) = mpsc::channel(64);
-    let (state, snapshots) = watch::channel(populated());
+    let (sender, mut receiver) = command_channel(64);
+    let (state, snapshots) = snapshot_channel(populated());
     let mut app = PlayerApp::new(sender, snapshots);
     let context = egui::Context::default();
     frame(&mut app, &context, size, Vec::new());
@@ -965,10 +1007,10 @@ fn clicking_seek_keeps_the_slider_and_time_at_the_requested_position() {
     let rail = app.seek_slider.unwrap();
     click_at(&mut app, &context, size, rail.center());
     let (target, request_id) = match receiver.try_recv().unwrap() {
-        AppCommand::Seek {
+        AppCommand::Playback(PlaybackCommand::Seek {
             position_ms,
             request_id,
-        } => (position_ms, request_id),
+        }) => (position_ms, request_id),
         command => panic!("expected seek: {command:?}"),
     };
     assert!((80_000..105_000).contains(&target));
@@ -998,8 +1040,8 @@ fn clicking_seek_keeps_the_slider_and_time_at_the_requested_position() {
 #[test]
 fn player_controls_stay_at_the_bottom_with_long_metadata_and_errors() {
     for size in [[950.0, 620.0], [1150.0, 760.0]] {
-        let (sender, _receiver) = mpsc::channel(64);
-        let (state, snapshots) = watch::channel(populated());
+        let (sender, _receiver) = command_channel(64);
+        let (state, snapshots) = snapshot_channel(populated());
         let mut app = PlayerApp::new(sender, snapshots);
         let context = egui::Context::default();
         frame(&mut app, &context, size, Vec::new());
@@ -1036,8 +1078,8 @@ fn player_controls_stay_at_the_bottom_with_long_metadata_and_errors() {
 #[test]
 fn player_mode_and_queue_buttons_are_symmetric_and_transport_commands_still_work() {
     for size in [[950.0, 620.0], [1150.0, 760.0]] {
-        let (sender, mut receiver) = mpsc::channel(64);
-        let (_state, snapshots) = watch::channel(populated());
+        let (sender, mut receiver) = command_channel(64);
+        let (_state, snapshots) = snapshot_channel(populated());
         let mut app = PlayerApp::new(sender, snapshots);
         let context = egui::Context::default();
         frame(&mut app, &context, size, Vec::new());
@@ -1054,11 +1096,20 @@ fn player_mode_and_queue_buttons_are_symmetric_and_transport_commands_still_work
         assert_eq!(mode.size(), queue.size());
         assert!((mode.center().y - queue.center().y).abs() < 1.0);
         click_at(&mut app, &context, size, previous.center());
-        assert!(matches!(receiver.try_recv(), Ok(AppCommand::Previous)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AppCommand::Playback(PlaybackCommand::Previous))
+        ));
         click_at(&mut app, &context, size, play.center());
-        assert!(matches!(receiver.try_recv(), Ok(AppCommand::PauseResume)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AppCommand::Playback(PlaybackCommand::PauseResume))
+        ));
         click_at(&mut app, &context, size, next.center());
-        assert!(matches!(receiver.try_recv(), Ok(AppCommand::Next)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AppCommand::Playback(PlaybackCommand::Next))
+        ));
         click_at(&mut app, &context, size, queue.center());
         assert_eq!(app.view, View::Queue);
         assert!(receiver.try_recv().is_err());
@@ -1068,8 +1119,8 @@ fn player_mode_and_queue_buttons_are_symmetric_and_transport_commands_still_work
 #[test]
 fn play_mode_button_cycles_through_all_modes_and_disables_when_disconnected() {
     let size = [1150.0, 760.0];
-    let (sender, mut receiver) = mpsc::channel(64);
-    let (state, snapshots) = watch::channel(populated());
+    let (sender, mut receiver) = command_channel(64);
+    let (state, snapshots) = snapshot_channel(populated());
     let mut app = PlayerApp::new(sender, snapshots);
     let context = egui::Context::default();
     for expected in [PlayMode::Repeat, PlayMode::Shuffle, PlayMode::Sequential] {
@@ -1078,7 +1129,7 @@ fn play_mode_button_cycles_through_all_modes_and_disables_when_disconnected() {
         let position = app.mode_button.unwrap().center();
         click_at(&mut app, &context, size, position);
         assert!(
-            matches!(receiver.try_recv(), Ok(AppCommand::SetPlayMode(mode)) if mode == expected)
+            matches!(receiver.try_recv(), Ok(AppCommand::Playback(PlaybackCommand::SetPlayMode(mode))) if mode == expected)
         );
         state.send_modify(|snapshot| snapshot.play_mode = expected);
     }
@@ -1093,11 +1144,11 @@ fn play_mode_button_cycles_through_all_modes_and_disables_when_disconnected() {
 fn next_button_at_queue_end_is_enabled_only_for_repeat_and_shuffle() {
     for mode in [PlayMode::Sequential, PlayMode::Repeat, PlayMode::Shuffle] {
         let size = [1150.0, 760.0];
-        let (sender, mut receiver) = mpsc::channel(64);
+        let (sender, mut receiver) = command_channel(64);
         let mut snapshot = populated();
         snapshot.play_mode = mode;
         snapshot.queue_index = Some(snapshot.queue.len() - 1);
-        let (_state, snapshots) = watch::channel(snapshot);
+        let (_state, snapshots) = snapshot_channel(snapshot);
         let mut app = PlayerApp::new(sender, snapshots);
         let context = egui::Context::default();
         frame(&mut app, &context, size, Vec::new());
@@ -1107,7 +1158,10 @@ fn next_button_at_queue_end_is_enabled_only_for_repeat_and_shuffle() {
         if mode == PlayMode::Sequential {
             assert!(receiver.try_recv().is_err());
         } else {
-            assert!(matches!(receiver.try_recv(), Ok(AppCommand::Next)));
+            assert!(matches!(
+                receiver.try_recv(),
+                Ok(AppCommand::Playback(PlaybackCommand::Next))
+            ));
         }
     }
 }
@@ -1125,8 +1179,8 @@ fn library_duration_and_queue_buttons_align_with_varied_metadata() {
         tracks[1].metadata.artist = "A long artist ".repeat(40);
         snapshot.library.tracks = Arc::new(tracks);
         snapshot.library.total = 3;
-        let (sender, _receiver) = mpsc::channel(64);
-        let (_state, snapshots) = watch::channel(snapshot);
+        let (sender, _receiver) = command_channel(64);
+        let (_state, snapshots) = snapshot_channel(snapshot);
         let mut app = PlayerApp::new(sender, snapshots);
         let context = egui::Context::default();
         frame(&mut app, &context, size, Vec::new());
@@ -1161,8 +1215,8 @@ fn library_duration_and_queue_buttons_align_with_varied_metadata() {
 #[test]
 fn track_double_click_plays_and_plus_only_enqueues() {
     let size = [1150.0, 760.0];
-    let (sender, mut receiver) = mpsc::channel(64);
-    let (_state, snapshots) = watch::channel(populated());
+    let (sender, mut receiver) = command_channel(64);
+    let (_state, snapshots) = snapshot_channel(populated());
     let mut app = PlayerApp::new(sender, snapshots);
     let context = egui::Context::default();
     frame(&mut app, &context, size, Vec::new());
@@ -1188,7 +1242,9 @@ fn track_double_click_plays_and_plus_only_enqueues() {
         "single click should not start playback"
     );
     click_at(&mut app, &context, size, title);
-    assert!(matches!(receiver.try_recv(), Ok(AppCommand::Play(track)) if track.id == 1));
+    assert!(
+        matches!(receiver.try_recv(), Ok(AppCommand::Playback(PlaybackCommand::Play(track))) if track.id == 1)
+    );
     assert!(receiver.try_recv().is_err());
     let copy = frame(&mut app, &context, size, vec![egui::Event::Copy]);
     assert!(
@@ -1201,7 +1257,9 @@ fn track_double_click_plays_and_plus_only_enqueues() {
     );
     for _ in 0..2 {
         click_at(&mut app, &context, size, plus);
-        assert!(matches!(receiver.try_recv(), Ok(AppCommand::Enqueue(track)) if track.id == 1));
+        assert!(
+            matches!(receiver.try_recv(), Ok(AppCommand::Playback(PlaybackCommand::Enqueue(track))) if track.id == 1)
+        );
         assert!(
             receiver.try_recv().is_err(),
             "double-clicking + must not also play"
@@ -1217,8 +1275,8 @@ fn missing_tracks_cannot_play_or_enqueue_from_the_row() {
     item.missing = true;
     snapshot.library.tracks = Arc::new(vec![item]);
     snapshot.library.total = 1;
-    let (sender, mut receiver) = mpsc::channel(64);
-    let (_state, snapshots) = watch::channel(snapshot);
+    let (sender, mut receiver) = command_channel(64);
+    let (_state, snapshots) = snapshot_channel(snapshot);
     let mut app = PlayerApp::new(sender, snapshots);
     let context = egui::Context::default();
     frame(&mut app, &context, size, Vec::new());
@@ -1242,8 +1300,8 @@ fn queue_double_click_and_context_menu_use_the_selected_duplicate_entry() {
     let size = [1150.0, 760.0];
     let mut snapshot = populated();
     snapshot.queue = Arc::new(vec![track(4), track(4)]);
-    let (sender, mut receiver) = mpsc::channel(64);
-    let (_state, snapshots) = watch::channel(snapshot);
+    let (sender, mut receiver) = command_channel(64);
+    let (_state, snapshots) = snapshot_channel(snapshot);
     let mut app = PlayerApp::new(sender, snapshots);
     app.view = View::Queue;
     let context = egui::Context::default();
@@ -1258,7 +1316,10 @@ fn queue_double_click_and_context_menu_use_the_selected_duplicate_entry() {
         .center();
     click_at(&mut app, &context, size, position);
     click_at(&mut app, &context, size, position);
-    assert!(matches!(receiver.try_recv(), Ok(AppCommand::PlayQueue(1))));
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(AppCommand::Playback(PlaybackCommand::PlayQueue(1)))
+    ));
     for pressed in [true, false] {
         frame(
             &mut app,
@@ -1278,7 +1339,7 @@ fn queue_double_click_and_context_menu_use_the_selected_duplicate_entry() {
     click(&mut app, &context, "Remove from queue");
     assert!(matches!(
         receiver.try_recv(),
-        Ok(AppCommand::RemoveQueue(1))
+        Ok(AppCommand::Playback(PlaybackCommand::RemoveQueue(1)))
     ));
     assert!(receiver.try_recv().is_err());
 }
@@ -1290,8 +1351,8 @@ fn queue_minus_removes_the_selected_entry_even_when_its_file_is_missing() {
         let mut entry = track(4);
         entry.missing = missing;
         snapshot.queue = Arc::new(vec![entry.clone(), entry]);
-        let (sender, mut receiver) = mpsc::channel(64);
-        let (_state, snapshots) = watch::channel(snapshot);
+        let (sender, mut receiver) = command_channel(64);
+        let (_state, snapshots) = snapshot_channel(snapshot);
         let mut app = PlayerApp::new(sender, snapshots);
         app.view = View::Queue;
         let context = egui::Context::default();
@@ -1302,7 +1363,7 @@ fn queue_minus_removes_the_selected_entry_even_when_its_file_is_missing() {
         click_at(&mut app, &context, [1150.0, 760.0], minus);
         assert!(matches!(
             receiver.try_recv(),
-            Ok(AppCommand::RemoveQueue(1))
+            Ok(AppCommand::Playback(PlaybackCommand::RemoveQueue(1)))
         ));
         assert!(receiver.try_recv().is_err());
     }
@@ -1398,7 +1459,7 @@ async fn library_thumbnails_bound_workers_skip_old_requests_and_reuse_results() 
     let probe = LibraryArtworkProbe::new();
     probe.held.store(true, Relaxed);
     let mut cache = thumbnails::Thumbnails::default();
-    cache.probe = Some(probe.clone());
+    cache.client = Some(artwork_client(probe.clone()));
     let context = egui::Context::default();
     cache.begin_frame(&context);
     for id in 0..40 {
@@ -1443,7 +1504,7 @@ async fn thumbnail_failures_are_cached_and_rescans_discard_stale_results() {
     use std::sync::atomic::Ordering::Relaxed;
     let probe = LibraryArtworkProbe::new();
     let mut cache = thumbnails::Thumbnails::default();
-    cache.probe = Some(probe.clone());
+    cache.client = Some(artwork_client(probe.clone()));
     let context = egui::Context::default();
     let absent = std::path::Path::new("/music/absent.flac");
     let broken = std::path::Path::new("/music/broken.flac");
@@ -1499,9 +1560,10 @@ async fn thumbnail_failures_are_cached_and_rescans_discard_stale_results() {
 async fn all_tracks_render_square_thumbnails_and_album_cards_put_names_below_covers() {
     for size in [[950.0, 620.0], [1150.0, 760.0]] {
         let probe = LibraryArtworkProbe::new();
-        let (sender, _receiver) = mpsc::channel(64);
-        let (_state, snapshots) = watch::channel(populated());
-        let mut app = PlayerApp::new(sender, snapshots).with_artwork_probe(probe.clone());
+        let (sender, _receiver) = command_channel(64);
+        let (_state, snapshots) = snapshot_channel(populated());
+        let mut app =
+            PlayerApp::new(sender, snapshots).with_artwork_client(artwork_client(probe.clone()));
         let context = egui::Context::default();
         let path = track(0).path;
         tokio::time::timeout(Duration::from_secs(3), async {

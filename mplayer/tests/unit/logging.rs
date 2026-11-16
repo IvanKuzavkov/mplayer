@@ -54,3 +54,78 @@ fn rolling_logs_retain_two_files_and_flush_structured_events() {
     assert!(directory.join("unrelated.txt").exists());
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[derive(Clone, Default)]
+struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for Capture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn command_traces_are_opt_in_and_follow_async_and_blocking_work() {
+    use mplayer_core::{PlaybackCommand, TraceContext};
+    use tracing::{Instrument, instrument::WithSubscriber};
+
+    for enabled in [false, true] {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let filter = if enabled {
+            format!("{DEFAULT_FILTER},mplayer::commands=debug")
+        } else {
+            DEFAULT_FILTER.into()
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(EnvFilter::new(filter))
+            .with_writer(move || writer.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let trace = tracing::dispatcher::with_default(&dispatch, || {
+            TraceContext::new(&PlaybackCommand::PauseResume)
+        });
+        let id = trace.id.to_string();
+        let span = trace.span.clone();
+        let blocking_dispatch = dispatch.clone();
+        tokio::spawn(
+            async move {
+                trace.event("playback", "handling");
+                let next = TraceContext::new(&PlaybackCommand::Stop);
+                trace.superseded_by(&next, "playback");
+                tokio::task::spawn_blocking(move || {
+                    tracing::dispatcher::with_default(&blocking_dispatch, || {
+                        trace.span.in_scope(|| {
+                            trace.event("audio", "handled");
+                            trace.failed("audio", &"test error");
+                        });
+                    });
+                })
+                .await
+                .unwrap();
+            }
+            .instrument(span)
+            .with_subscriber(dispatch),
+        )
+        .await
+        .unwrap();
+        let text = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        if enabled {
+            assert!(text.contains(&format!("\"trace_id\":\"{id}\"")));
+            assert!(text.contains("\"level\":\"DEBUG\""));
+            assert!(text.contains("\"component\":\"audio\""));
+            assert!(text.contains("\"stage\":\"handled\""));
+            assert!(text.contains("\"stage\":\"failed\""));
+            assert!(text.contains("replacement_trace_id"));
+        } else {
+            assert!(
+                text.is_empty(),
+                "command DEBUG traces must respect the default filter"
+            );
+        }
+    }
+}

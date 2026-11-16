@@ -18,8 +18,8 @@ fn folder_details_expand_independently_and_rescan_uses_icon_and_scan_state() {
         long.path = format!("/music/{}", "A long folder name ".repeat(20)).into();
         folders.push(long);
         snapshot.folders.total = 3;
-        let (sender, mut receiver) = mpsc::channel(64);
-        let (state, snapshots) = watch::channel(snapshot);
+        let (sender, mut receiver) = command_channel(64);
+        let (state, snapshots) = snapshot_channel(snapshot);
         let mut app = PlayerApp::new(sender, snapshots);
         app.tab = LibraryTab::Folders;
         let context = egui::Context::default();
@@ -60,7 +60,7 @@ fn folder_details_expand_independently_and_rescan_uses_icon_and_scan_state() {
         click_at(&mut app, &context, size, rescan);
         assert!(matches!(
             receiver.try_recv(),
-            Ok(AppCommand::RescanFolder(1))
+            Ok(AppCommand::Library(LibraryCommand::RescanFolder(1)))
         ));
         assert!(app.group.is_none());
         state.send_modify(|snapshot| snapshot.scan.running = true);
@@ -91,8 +91,8 @@ fn folder_header_replaces_search_with_path_count_status_and_tracks() {
                 folder.status = mplayer_core::ScanStatus::Error;
                 folder.error = Some("Cannot read album".into());
             }
-            let (sender, _receiver) = mpsc::channel(64);
-            let (_state, snapshots) = watch::channel(snapshot);
+            let (sender, _receiver) = command_channel(64);
+            let (_state, snapshots) = snapshot_channel(snapshot);
             let mut app = PlayerApp::new(sender, snapshots);
             app.tab = LibraryTab::Folders;
             app.group = Some(LibraryFilter::Folder(path));
@@ -139,8 +139,8 @@ fn folder_header_replaces_search_with_path_count_status_and_tracks() {
 
 #[test]
 fn folder_header_does_not_show_another_folders_summary_while_loading() {
-    let (sender, _receiver) = mpsc::channel(64);
-    let (_state, snapshots) = watch::channel(populated());
+    let (sender, _receiver) = command_channel(64);
+    let (_state, snapshots) = snapshot_channel(populated());
     let mut app = PlayerApp::new(sender, snapshots);
     app.tab = LibraryTab::Folders;
     app.group = Some(LibraryFilter::Folder("/music/New folder".into()));

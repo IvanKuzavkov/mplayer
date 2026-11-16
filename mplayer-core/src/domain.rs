@@ -4,7 +4,6 @@ use std::{
 };
 
 pub type Result<T> = anyhow::Result<T>;
-pub type Wake = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TrackMetadata {
@@ -303,64 +302,6 @@ impl Default for AppSnapshot {
             status: "Ready".into(),
         }
     }
-}
-
-#[derive(Clone, Debug)]
-pub enum AppCommand {
-    Import(Vec<PathBuf>),
-    RemoveScanFolder(PathBuf),
-    Rescan,
-    RescanFolder(i64),
-    CancelScan,
-    Search {
-        query: String,
-        offset: u64,
-    },
-    BrowseLibrary {
-        filter: LibraryFilter,
-        query: String,
-        offset: u64,
-    },
-    ListFolders {
-        query: String,
-        offset: u64,
-    },
-    ListAlbums {
-        query: String,
-        offset: u64,
-    },
-    Play(Track),
-    Enqueue(Track),
-    EnqueueAlbum(AlbumKey),
-    PlayAlbum(AlbumKey),
-    RemoveQueue(usize),
-    ClearQueue,
-    PlayQueue(usize),
-    PauseResume,
-    Stop,
-    Previous,
-    Next,
-    SetPlayMode(PlayMode),
-    Seek {
-        position_ms: u64,
-        request_id: u64,
-    },
-    SetVolume(f32),
-    SetDevice(Option<String>),
-    CreatePlaylist(String),
-    DeletePlaylist(i64),
-    SelectPlaylist(Option<i64>),
-    AddToPlaylist {
-        playlist_id: i64,
-        track_id: i64,
-    },
-    RemovePlaylistEntry(i64),
-    MovePlaylistEntry {
-        entry_id: i64,
-        position: usize,
-    },
-    PlayPlaylist(i64),
-    Shutdown,
 }
 
 pub const PAGE_SIZE: u64 = 256;

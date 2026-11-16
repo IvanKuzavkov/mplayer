@@ -7,12 +7,16 @@ mod output;
 mod pcm;
 
 use anyhow::{anyhow, bail};
-pub use decoder::SymphoniaProbe;
+/// Creates the stateless decoder-backed metadata and artwork reader.
+pub fn metadata_probe() -> impl mplayer_core::MetadataProbe + Clone + 'static {
+    decoder::SymphoniaProbe
+}
 
 use decoder::Decoder;
 use dsp::Converter;
 use mplayer_core::{
-    AudioCommand, OutputDevice, PlaybackSnapshot, PlaybackState, Result, Track, Wake,
+    AudioCommand, CommandEnvelope, OutputDevice, PlaybackSnapshot, PlaybackState, Result,
+    TraceContext, Track,
 };
 use output::{Output, RateSelection};
 use pcm::PcmFormat;
@@ -30,7 +34,7 @@ use tokio::sync::watch;
 use tracing::Instrument;
 
 pub struct AudioEngine {
-    sender: SyncSender<AudioCommand>,
+    sender: SyncSender<CommandEnvelope<AudioCommand>>,
     snapshots: watch::Receiver<PlaybackSnapshot>,
     thread: Option<JoinHandle<()>>,
     discovery: tokio::task::JoinHandle<()>,
@@ -40,7 +44,7 @@ pub struct AudioEngine {
 impl AudioEngine {
     /// Requires an active Tokio runtime for background output-device discovery.
     #[tracing::instrument(skip_all, err)]
-    pub fn start(wake: Wake) -> Result<Self> {
+    pub fn start() -> Result<Self> {
         let runtime = tokio::runtime::Handle::try_current()?;
         let (device_sender, device_updates) = watch::channel(Vec::new());
         let (sender, receiver) = mpsc::sync_channel(64);
@@ -55,7 +59,7 @@ impl AudioEngine {
             .name("mplayer-audio".into())
             .spawn(move || {
                 parent.in_scope(|| {
-                    Worker::new(snapshots_tx, wake, worker_stop, device_updates).run(receiver)
+                    Worker::new(snapshots_tx, worker_stop, device_updates).run(receiver)
                 });
             })?;
         let discovery = runtime.spawn(
@@ -70,7 +74,7 @@ impl AudioEngine {
             stop,
         })
     }
-    pub fn sender(&self) -> SyncSender<AudioCommand> {
+    pub fn sender(&self) -> SyncSender<CommandEnvelope<AudioCommand>> {
         self.sender.clone()
     }
     pub fn subscribe(&self) -> watch::Receiver<PlaybackSnapshot> {
@@ -80,7 +84,9 @@ impl AudioEngine {
     pub fn shutdown(mut self) -> Result<()> {
         self.discovery.abort();
         self.stop.store(true, Ordering::Relaxed);
-        let _ = self.sender.try_send(AudioCommand::Shutdown);
+        let _ = self
+            .sender
+            .try_send(TraceContext::new(&"audio_shutdown").wrap(AudioCommand::Shutdown));
         if let Some(thread) = self.thread.take() {
             let deadline = Instant::now() + Duration::from_secs(3);
             while !thread.is_finished() && Instant::now() < deadline {
@@ -101,7 +107,9 @@ impl Drop for AudioEngine {
         self.discovery.abort();
         if let Some(thread) = self.thread.take() {
             self.stop.store(true, Ordering::Relaxed);
-            let _ = self.sender.try_send(AudioCommand::Shutdown);
+            let _ = self
+                .sender
+                .try_send(TraceContext::new(&"audio_shutdown").wrap(AudioCommand::Shutdown));
             if thread.is_finished() {
                 let _ = thread.join();
             }
@@ -220,7 +228,7 @@ type OutputFactory = fn(u32, usize, PcmFormat, RateSelection, Option<&str>, f32)
 struct Worker {
     sender: watch::Sender<PlaybackSnapshot>,
     snapshot: PlaybackSnapshot,
-    wake: Wake,
+    trace: Option<TraceContext>,
     selected_device: Option<String>,
     device_updates: watch::Receiver<Vec<OutputDevice>>,
     recovery: Option<Recovery>,
@@ -241,7 +249,6 @@ struct Worker {
 impl Worker {
     fn new(
         sender: watch::Sender<PlaybackSnapshot>,
-        wake: Wake,
         stop: Arc<AtomicBool>,
         mut device_updates: watch::Receiver<Vec<OutputDevice>>,
     ) -> Self {
@@ -253,7 +260,7 @@ impl Worker {
                 devices,
                 ..Default::default()
             },
-            wake,
+            trace: None,
             selected_device: None,
             device_updates,
             recovery: None,
@@ -275,14 +282,13 @@ impl Worker {
     #[cfg(test)]
     fn with_devices(
         sender: watch::Sender<PlaybackSnapshot>,
-        wake: Wake,
         stop: Arc<AtomicBool>,
         devices: Vec<OutputDevice>,
     ) -> Self {
-        Self::new(sender, wake, stop, watch::channel(devices).1)
+        Self::new(sender, stop, watch::channel(devices).1)
     }
     #[tracing::instrument(skip_all)]
-    fn run(mut self, receiver: Receiver<AudioCommand>) {
+    fn run(mut self, receiver: Receiver<CommandEnvelope<AudioCommand>>) {
         tracing::info!("Audio worker started");
         self.publish();
         while !self.stop.load(Ordering::Relaxed) {
@@ -293,16 +299,40 @@ impl Worker {
                 Duration::from_millis(100)
             };
             match receiver.recv_timeout(timeout) {
-                Ok(AudioCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Ok(command) => {
-                    if let Err(error) = self.command(command) {
-                        self.fail(error);
+                    let trace = command.trace;
+                    trace.event("audio", "handling");
+                    if matches!(command.payload, AudioCommand::Shutdown) {
+                        trace.event("audio", "handled");
+                        break;
+                    }
+                    if matches!(
+                        command.payload,
+                        AudioCommand::Load { .. } | AudioCommand::Stop { .. }
+                    ) {
+                        self.trace = Some(trace.clone());
+                    }
+                    match trace.span.in_scope(|| self.command(command.payload)) {
+                        Ok(()) => trace.event("audio", "handled"),
+                        Err(error) => {
+                            trace.failed("audio", &error);
+                            self.fail(error);
+                        }
                     }
                     self.publish();
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => (),
             }
-            if let Err(error) = self.tick() {
+            let span = self
+                .trace
+                .as_ref()
+                .map(|trace| trace.span.clone())
+                .unwrap_or_else(tracing::Span::none);
+            if let Err(error) = span.in_scope(|| self.tick()) {
+                if let Some(trace) = &self.trace {
+                    trace.failed("audio", &error);
+                }
                 self.fail(error);
                 self.publish();
             }
@@ -981,16 +1011,14 @@ impl Worker {
         }
         // Paused streams still poll for device failures and underruns. Only wake
         // the UI when that polling changes something it can display.
-        if self.sender.send_if_modified(|previous| {
+        self.sender.send_if_modified(|previous| {
             if *previous == self.snapshot {
                 false
             } else {
                 previous.clone_from(&self.snapshot);
                 true
             }
-        }) {
-            (self.wake)();
-        }
+        });
         self.last_publish = Instant::now();
     }
 }

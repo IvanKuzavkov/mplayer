@@ -3,8 +3,8 @@ use super::*;
 #[test]
 fn queue_back_returns_to_previous_view_and_clear_icon_obeys_availability() {
     for size in [[950.0, 620.0], [1150.0, 760.0]] {
-        let (sender, mut receiver) = mpsc::channel(64);
-        let (state, snapshots) = watch::channel(populated());
+        let (sender, mut receiver) = command_channel(64);
+        let (state, snapshots) = snapshot_channel(populated());
         let mut app = PlayerApp::new(sender, snapshots);
         let context = egui::Context::default();
         for previous in [View::Library, View::Playlists, View::ScanFolders] {
@@ -29,7 +29,10 @@ fn queue_back_returns_to_previous_view_and_clear_icon_obeys_availability() {
         frame(&mut app, &context, size, Vec::new());
         let clear = app.clear_button.unwrap().center();
         click_at(&mut app, &context, size, clear);
-        assert!(matches!(receiver.try_recv(), Ok(AppCommand::ClearQueue)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AppCommand::Playback(PlaybackCommand::ClearQueue))
+        ));
         assert!(receiver.try_recv().is_err());
         state.send_modify(|state| state.queue = Arc::default());
         frame(&mut app, &context, size, Vec::new());

@@ -16,8 +16,8 @@ fn player_metadata_fits_above_controls_at_minimum_height() {
             current.metadata.album.clone(),
             "FLAC · 44.1 kHz · 24 bit".into(),
         ];
-        let (sender, _receiver) = mpsc::channel(64);
-        let (state, snapshots) = watch::channel(snapshot);
+        let (sender, _receiver) = command_channel(64);
+        let (state, snapshots) = snapshot_channel(snapshot);
         let mut app = PlayerApp::new(sender, snapshots);
         let context = egui::Context::default();
         let mut controls = None;

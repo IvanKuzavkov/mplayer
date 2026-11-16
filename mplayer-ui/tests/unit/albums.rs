@@ -9,8 +9,8 @@ fn artwork_hover_shows_album_actions_without_opening_album_or_old_tooltip() {
             if detail {
                 snapshot.library_filter = LibraryFilter::Album(key.clone());
             }
-            let (sender, mut receiver) = mpsc::channel(64);
-            let (_state, snapshots) = watch::channel(snapshot);
+            let (sender, mut receiver) = command_channel(64);
+            let (_state, snapshots) = snapshot_channel(snapshot);
             let mut app = PlayerApp::new(sender, snapshots);
             app.tab = LibraryTab::Albums;
             if detail {
@@ -35,13 +35,13 @@ fn artwork_hover_shows_album_actions_without_opening_album_or_old_tooltip() {
             assert!(enqueue.right() < play.left());
             click_at(&mut app, &context, size, enqueue.center());
             assert!(
-                matches!(receiver.try_recv(), Ok(AppCommand::EnqueueAlbum(album)) if album == key)
+                matches!(receiver.try_recv(), Ok(AppCommand::Playback(PlaybackCommand::EnqueueAlbum(album))) if album == key)
             );
             assert!(receiver.try_recv().is_err());
             assert_eq!(app.group.is_some(), detail);
             click_at(&mut app, &context, size, play.center());
             assert!(
-                matches!(receiver.try_recv(), Ok(AppCommand::PlayAlbum(album)) if album == key)
+                matches!(receiver.try_recv(), Ok(AppCommand::Playback(PlaybackCommand::PlayAlbum(album))) if album == key)
             );
             assert!(receiver.try_recv().is_err());
             assert_eq!(app.group.is_some(), detail);

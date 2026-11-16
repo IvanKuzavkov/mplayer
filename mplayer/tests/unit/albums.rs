@@ -25,7 +25,7 @@ async fn enqueue_album_preserves_current_queue_and_play_album_replaces_it() {
     }
     let (progress, _) = watch::channel(ScanProgress::default());
     let (_cancel, scan) = scan_task(
-        h.app.store.clone(),
+        h.store.clone(),
         ScanRequest::Roots(vec![root]),
         Arc::new(AlbumProbe),
         progress,
@@ -37,7 +37,7 @@ async fn enqueue_album_preserves_current_queue_and_play_album_replaces_it() {
         title: "Album".into(),
         artist: "Artist".into(),
     };
-    let ordered = h.app.store.album_tracks(&key).await.unwrap();
+    let ordered = h.store.album_tracks(&key).await.unwrap();
     assert_eq!(
         ordered
             .iter()
@@ -49,40 +49,52 @@ async fn enqueue_album_preserves_current_queue_and_play_album_replaces_it() {
     h.app.play_index(0).unwrap();
     let generation = h.app.generation;
     h.audio.try_iter().for_each(drop);
-    h.app
-        .handle(AppCommand::EnqueueAlbum(key.clone()))
+    let player = tokio::spawn(h.app.run(h.shutdown.clone()));
+    let library = tokio::spawn(h.library.run(h.shutdown.clone()));
+    wait_for(&mut h.player_snapshots, |state| state.queue.len() == 1).await;
+    h.audio.try_iter().for_each(drop);
+    h.commands
+        .send(PlaybackCommand::EnqueueAlbum(key.clone()).into())
         .await
         .unwrap();
-    assert_eq!(h.app.generation, generation);
-    assert_eq!(h.app.state.queue_index, Some(0));
-    assert_eq!(h.app.state.queue[0].id, 999);
-    assert_eq!(&h.app.state.queue[1..], ordered);
+    wait_for(&mut h.player_snapshots, |state| state.queue.len() == 4).await;
+    {
+        let state = h.player_snapshots.borrow();
+        assert_eq!(state.queue_index, Some(0));
+        assert_eq!(state.queue[0].id, 999);
+        assert_eq!(&state.queue[1..], ordered);
+    }
     assert!(
         matches!(h.audio.try_recv().unwrap(), AudioCommand::SetNext(Some(track)) if track == ordered[0])
     );
-    assert!(h.audio.try_recv().is_err());
-    h.app
-        .handle(AppCommand::PlayAlbum(key.clone()))
+    h.commands
+        .send(PlaybackCommand::PlayAlbum(key.clone()).into())
         .await
         .unwrap();
-    assert_eq!(h.app.state.queue.as_slice(), ordered);
-    assert_eq!(h.app.state.queue_index, Some(0));
-    assert_eq!(h.app.generation, generation + 1);
+    wait_for(&mut h.player_snapshots, |state| state.queue.len() == 3).await;
+    assert_eq!(h.player_snapshots.borrow().queue.as_slice(), ordered);
     assert!(
-        matches!(h.audio.try_recv().unwrap(), AudioCommand::Load { track, next: Some(next), .. } if track == ordered[0] && next == ordered[1])
+        matches!(h.audio.try_recv().unwrap(), AudioCommand::Load { track, next: Some(next), generation: next_generation } if track == ordered[0] && next == ordered[1] && next_generation == generation + 1)
     );
     let missing = AlbumKey {
         title: "Deleted album".into(),
         ..key
     };
     for command in [
-        AppCommand::PlayAlbum(missing.clone()),
-        AppCommand::EnqueueAlbum(missing),
+        PlaybackCommand::PlayAlbum(missing.clone()),
+        PlaybackCommand::EnqueueAlbum(missing),
     ] {
-        assert!(h.app.handle(command).await.is_err());
-        assert_eq!(h.app.state.queue.as_slice(), ordered);
-        assert_eq!(h.app.generation, generation + 1);
+        h.player_snapshots.borrow_and_update();
+        h.commands.send(command.into()).await.unwrap();
+        wait_for(&mut h.player_snapshots, |state| {
+            state.playback.error.is_some()
+        })
+        .await;
+        assert_eq!(h.player_snapshots.borrow().queue.as_slice(), ordered);
         assert!(h.audio.try_recv().is_err());
     }
-    h.app.store.close().await;
+    h.commands.0.shutdown();
+    player.await.unwrap().unwrap();
+    library.await.unwrap().unwrap();
+    h.store.close().await;
 }

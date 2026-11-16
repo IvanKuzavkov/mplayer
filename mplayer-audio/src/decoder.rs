@@ -131,7 +131,7 @@ fn open_format(path: &Path, artwork: bool) -> Result<Box<dyn FormatReader>> {
 }
 
 #[derive(Default, Clone)]
-pub struct SymphoniaProbe;
+pub(crate) struct SymphoniaProbe;
 
 impl MetadataProbe for SymphoniaProbe {
     #[tracing::instrument(skip_all, fields(path = %path.display()), err)]

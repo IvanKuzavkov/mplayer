@@ -1,12 +1,11 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::Arc,
     time::Duration,
 };
 
 use eframe::egui;
-use mplayer_core::MetadataProbe;
+use mplayer_core::ArtworkClient;
 use tokio::sync::oneshot;
 
 const MAX_CACHED: usize = 128;
@@ -27,7 +26,7 @@ struct Pending {
 
 #[derive(Default)]
 pub(super) struct Thumbnails {
-    pub probe: Option<Arc<dyn MetadataProbe>>,
+    pub client: Option<ArtworkClient>,
     entries: HashMap<PathBuf, Entry>,
     pending: Vec<Pending>,
     visible: Vec<PathBuf>,
@@ -97,7 +96,7 @@ impl Thumbnails {
                 .expect("nonempty cache");
             self.entries.remove(&oldest);
         }
-        let Some(probe) = &self.probe else {
+        let Some(client) = &self.client else {
             return;
         };
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -114,25 +113,23 @@ impl Thumbnails {
             }
             let path = path.clone();
             let worker_path = path.clone();
-            let probe = Arc::clone(probe);
+            let client = client.clone();
             let wake = context.clone();
             let (sender, result) = oneshot::channel();
-            let span = tracing::debug_span!("load_library_artwork", path = %path.display());
-            runtime.spawn_blocking(move || {
-                span.in_scope(|| {
-                    let result = probe
-                        .artwork(&worker_path)
-                        .map_err(|error| error.to_string())
-                        .and_then(|artwork| {
-                            artwork
-                                .map(|artwork| {
-                                    super::artwork::decode_with_size(&artwork.data, THUMBNAIL_SIZE)
-                                })
-                                .transpose()
-                        });
-                    let _ = sender.send(result);
-                    wake.request_repaint();
-                })
+            runtime.spawn(async move {
+                let result = match client.read(worker_path).await {
+                    Ok(Some(artwork)) => tokio::task::spawn_blocking(move || {
+                        super::artwork::decode_with_size(&artwork.data, THUMBNAIL_SIZE)
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result)
+                    .map(Some),
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(error.to_string()),
+                };
+                let _ = sender.send(result);
+                wake.request_repaint();
             });
             self.pending.push(Pending {
                 path,

@@ -1,8 +1,13 @@
 use super::*;
+use library::LibraryService;
+use playback::{PlaybackService, index_after_removal};
+use std::path::PathBuf;
 #[path = "albums.rs"]
 mod album_tests;
 #[path = "queue.rs"]
 mod queue_tests;
+#[path = "services.rs"]
+mod service_tests;
 use std::{
     path::Path,
     sync::{
@@ -18,7 +23,7 @@ async fn play_modes_control_prefetch_automatic_advancement_and_manual_next() {
     for mode in [PlayMode::Sequential, PlayMode::Repeat, PlayMode::Shuffle] {
         let mut h = Harness::new().await;
         h.app.state.queue = vec![track(1), track(2), track(3)].into();
-        h.app.handle(AppCommand::SetPlayMode(mode)).await.unwrap();
+        h.app.handle(PlaybackCommand::SetPlayMode(mode)).unwrap();
         h.audio.try_iter().for_each(drop);
         h.app.play_index(2).unwrap();
         let generation = h.app.generation;
@@ -49,16 +54,16 @@ async fn play_modes_control_prefetch_automatic_advancement_and_manual_next() {
             assert!(
                 matches!(h.audio.try_recv().unwrap(), AudioCommand::SetNext(Some(next)) if next == h.app.state.queue[index])
             );
-            h.app.handle(AppCommand::Next).await.unwrap();
+            h.app.handle(PlaybackCommand::Next).unwrap();
             assert_eq!(h.app.state.queue_index, Some(index));
             assert!(
                 matches!(h.audio.try_recv().unwrap(), AudioCommand::Load { track, .. } if track == h.app.state.queue[index])
             );
         } else {
-            h.app.handle(AppCommand::Next).await.unwrap();
+            h.app.handle(PlaybackCommand::Next).unwrap();
             assert!(h.audio.try_recv().is_err());
         }
-        h.app.store.close().await;
+        h.store.close().await;
     }
 }
 
@@ -87,7 +92,7 @@ async fn coalesced_completions_stop_sequential_and_restart_repeat_and_shuffle() 
                 matches!(h.audio.try_recv().unwrap(), AudioCommand::Load { track, next: Some(next), .. } if track.id == 1 && next.id == 2)
             );
         }
-        h.app.store.close().await;
+        h.store.close().await;
     }
 }
 
@@ -101,11 +106,13 @@ async fn play_mode_changes_preserve_playback_and_retry_prefetch_under_backpressu
     let generation = h.app.generation;
     h.audio.try_iter().for_each(drop);
     for _ in 0..64 {
-        h.app.audio.try_send(AudioCommand::Pause).unwrap();
+        h.app
+            .audio
+            .try_send(TraceContext::new(&"fill").wrap(AudioCommand::Pause))
+            .unwrap();
     }
     h.app
-        .handle(AppCommand::SetPlayMode(PlayMode::Repeat))
-        .await
+        .handle(PlaybackCommand::SetPlayMode(PlayMode::Repeat))
         .unwrap();
     assert_eq!(h.app.state.play_mode, PlayMode::Repeat);
     assert_eq!(h.app.state.queue_index, Some(1));
@@ -118,14 +125,13 @@ async fn play_mode_changes_preserve_playback_and_retry_prefetch_under_backpressu
         matches!(h.audio.try_recv().unwrap(), AudioCommand::SetNext(Some(next)) if next.id == 1)
     );
     h.app
-        .handle(AppCommand::SetPlayMode(PlayMode::Sequential))
-        .await
+        .handle(PlaybackCommand::SetPlayMode(PlayMode::Sequential))
         .unwrap();
     assert!(matches!(
         h.audio.try_recv().unwrap(),
         AudioCommand::SetNext(None)
     ));
-    h.app.store.close().await;
+    h.store.close().await;
 }
 
 #[tokio::test]
@@ -147,7 +153,7 @@ async fn mode_selection_handles_empty_singleton_and_edited_queues() {
             .load_queue(vec![track(1), track(2), track(3)].into(), 1)
             .unwrap();
         h.audio.try_iter().for_each(drop);
-        h.app.handle(AppCommand::RemoveQueue(0)).await.unwrap();
+        h.app.handle(PlaybackCommand::RemoveQueue(0)).unwrap();
         assert_eq!(h.app.state.queue_index, Some(0));
         let expected = h
             .app
@@ -156,7 +162,7 @@ async fn mode_selection_handles_empty_singleton_and_edited_queues() {
         assert!(
             matches!(h.audio.try_recv().unwrap(), AudioCommand::SetNext(next) if next == expected)
         );
-        h.app.handle(AppCommand::ClearQueue).await.unwrap();
+        h.app.handle(PlaybackCommand::ClearQueue).unwrap();
         h.audio.try_iter().for_each(drop);
         assert!(h.app.next_queue_index.is_none());
     }
@@ -167,7 +173,7 @@ async fn mode_selection_handles_empty_singleton_and_edited_queues() {
         seen.insert(index);
     }
     assert_eq!(seen.len(), 4);
-    h.app.store.close().await;
+    h.store.close().await;
 }
 
 struct TempDirectory(PathBuf);
@@ -209,16 +215,43 @@ impl MetadataProbe for Probe {
     }
 }
 
+struct AudioMessages(Receiver<CommandEnvelope<AudioCommand>>);
+impl AudioMessages {
+    fn try_recv(&self) -> std::result::Result<AudioCommand, std::sync::mpsc::TryRecvError> {
+        self.0.try_recv().map(|command| command.payload)
+    }
+    fn try_iter(&self) -> impl Iterator<Item = AudioCommand> + '_ {
+        self.0.try_iter().map(|command| command.payload)
+    }
+}
+struct Commands(CommandRouter);
+impl Commands {
+    async fn send(&self, command: AppCommand) -> Result<()> {
+        self.0
+            .try_send(self.0.prepare(command))
+            .map_err(|error| anyhow::anyhow!("{error}"))
+    }
+}
+struct TaskGuard(tokio::task::JoinHandle<Result<()>>);
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 struct Harness {
     _directory: TempDirectory,
-    app: Application,
-    audio: Receiver<AudioCommand>,
+    app: PlaybackService,
+    library: LibraryService,
+    store: Store,
+    audio: AudioMessages,
     playback: watch::Sender<PlaybackSnapshot>,
-    commands: mpsc::Sender<AppCommand>,
-    snapshots: watch::Receiver<AppSnapshot>,
-    _logging_guard: tracing_appender::non_blocking::WorkerGuard,
+    commands: Commands,
+    snapshots: watch::Receiver<LibrarySnapshot>,
+    player_snapshots: watch::Receiver<PlayerSnapshot>,
+    settings: watch::Receiver<SettingsSnapshot>,
+    shutdown: watch::Receiver<bool>,
+    _settings_task: TaskGuard,
 }
-
 impl Harness {
     async fn new() -> Self {
         let directory = TempDirectory::new();
@@ -228,27 +261,53 @@ impl Harness {
         let (audio_sender, audio) = sync_channel(64);
         let (playback, playback_receiver) = watch::channel(PlaybackSnapshot::default());
         let (commands, receiver) = mpsc::channel(64);
-        let (output, snapshots) = watch::channel(AppSnapshot::default());
-        let (writer, logging_guard) = tracing_appender::non_blocking(std::io::sink());
-        let app = Application::new(
-            store,
+        let (library_sender, library_receiver) = mpsc::channel(64);
+        let client = LibraryClient(library_sender);
+        let (player_output, player_snapshots) = watch::channel(PlayerSnapshot::default());
+        let (library_output, snapshots) = watch::channel(LibrarySnapshot::default());
+        let (settings_output, settings) = watch::channel(SettingsSnapshot::default());
+        let trace = TraceContext::new(&"test_settings");
+        let (desired, updates) = watch::channel(SettingsUpdate {
+            volume: trace.wrap(1.0),
+            device: trace.wrap(None),
+        });
+        let settings_task = TaskGuard(tokio::spawn(settings::run(
+            store.clone(),
+            updates,
+            settings_output,
+        )));
+        let (stop, shutdown) = watch::channel(false);
+        let app = PlaybackService::new(
             audio_sender,
             playback_receiver,
             receiver,
-            output,
-            Arc::new(|| {}),
+            player_output,
+            client.clone(),
+            desired,
+        );
+        let library = LibraryService::new(
+            store.clone(),
             Arc::new(Probe),
-            writer.error_counter(),
+            library_receiver,
+            library_output,
         );
         Self {
             _directory: directory,
             app,
-            audio,
+            library,
+            store,
+            audio: AudioMessages(audio),
             playback,
-            commands,
+            commands: Commands(CommandRouter::new(commands, client, stop)),
             snapshots,
-            _logging_guard: logging_guard,
+            player_snapshots,
+            settings,
+            shutdown,
+            _settings_task: settings_task,
         }
+    }
+    async fn persisted_volume(&mut self, volume: f32) {
+        wait_for(&mut self.settings, |settings| settings.volume == volume).await;
     }
 }
 
@@ -268,10 +327,7 @@ fn track(id: i64) -> Track {
     }
 }
 
-async fn wait_for(
-    snapshot: &mut watch::Receiver<AppSnapshot>,
-    predicate: impl Fn(&AppSnapshot) -> bool,
-) {
+async fn wait_for<T>(snapshot: &mut watch::Receiver<T>, predicate: impl Fn(&T) -> bool) {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if predicate(&snapshot.borrow()) {
@@ -299,65 +355,65 @@ fn queue_removal_preserves_current_track_and_handles_last_entry() {
 #[tokio::test]
 async fn new_playlists_open_immediately_and_deletion_returns_to_the_list() {
     let mut h = Harness::new().await;
-    h.app
-        .handle(AppCommand::CreatePlaylist("  First  ".into()))
+    h.library
+        .handle(LibraryCommand::CreatePlaylist("  First  ".into()))
         .await
         .unwrap();
-    let first = h.app.state.selected_playlist.unwrap();
-    assert_eq!(h.app.state.playlists[0].name, "First");
+    let first = h.library.state.selected_playlist.unwrap();
+    assert_eq!(h.library.state.playlists[0].name, "First");
     assert!(
-        h.app
-            .handle(AppCommand::CreatePlaylist(" first ".into()))
+        h.library
+            .handle(LibraryCommand::CreatePlaylist(" first ".into()))
             .await
             .is_err()
     );
-    assert_eq!(h.app.state.selected_playlist, Some(first));
-    assert_eq!(h.app.state.playlists.len(), 1);
-    h.app
-        .handle(AppCommand::CreatePlaylist("Second".into()))
+    assert_eq!(h.library.state.selected_playlist, Some(first));
+    assert_eq!(h.library.state.playlists.len(), 1);
+    h.library
+        .handle(LibraryCommand::CreatePlaylist("Second".into()))
         .await
         .unwrap();
-    let second = h.app.state.selected_playlist.unwrap();
+    let second = h.library.state.selected_playlist.unwrap();
     assert_ne!(first, second);
-    assert!(h.app.state.playlist_entries.is_empty());
-    h.app
-        .handle(AppCommand::DeletePlaylist(second))
+    assert!(h.library.state.playlist_entries.is_empty());
+    h.library
+        .handle(LibraryCommand::DeletePlaylist(second))
         .await
         .unwrap();
-    assert_eq!(h.app.state.selected_playlist, None);
-    assert_eq!(h.app.state.playlists.len(), 1);
-    assert_eq!(h.app.state.playlists[0].id, first);
-    h.app.store.close().await;
+    assert_eq!(h.library.state.selected_playlist, None);
+    assert_eq!(h.library.state.playlists.len(), 1);
+    assert_eq!(h.library.state.playlists[0].id, first);
+    h.store.close().await;
 }
 
 #[tokio::test]
 async fn removing_a_root_rejects_running_and_queued_scans() {
     let mut h = Harness::new().await;
-    h.app.scan_task = Some(tokio::spawn(std::future::pending()));
+    h.library.scan_task = Some(tokio::spawn(std::future::pending()));
     assert!(
-        h.app
-            .handle(AppCommand::RemoveScanFolder("/music".into()))
+        h.library
+            .handle(LibraryCommand::RemoveScanFolder("/music".into()))
             .await
             .is_err()
     );
-    h.app.scan_task.take().unwrap().abort();
-    h.app.pending_imports.push("/music".into());
+    h.library.scan_task.take().unwrap().abort();
+    h.library.pending_imports.push("/music".into());
     assert!(
-        h.app
-            .handle(AppCommand::RemoveScanFolder("/music".into()))
+        h.library
+            .handle(LibraryCommand::RemoveScanFolder("/music".into()))
             .await
             .is_err()
     );
-    h.app.pending_imports.clear();
-    h.app
-        .handle(AppCommand::RemoveScanFolder("/music".into()))
+    h.library.pending_imports.clear();
+    h.library
+        .handle(LibraryCommand::RemoveScanFolder("/music".into()))
         .await
         .unwrap();
     assert_eq!(
-        h.app.state.status,
+        h.library.state.status,
         "Music folder removed; files kept on disk"
     );
-    h.app.store.close().await;
+    h.store.close().await;
 }
 
 #[tokio::test]
@@ -380,9 +436,9 @@ async fn disconnected_output_notification_resumes_without_reloading_track() {
     assert_eq!(h.app.state.status, message);
     assert!(h.app.state.playback.error.is_none());
 
-    h.app.handle(AppCommand::SetDevice(None)).await.unwrap();
+    h.app.handle(PlaybackCommand::SetDevice(None)).unwrap();
     h.audio.try_iter().for_each(drop);
-    h.app.handle(AppCommand::PauseResume).await.unwrap();
+    h.app.handle(PlaybackCommand::PauseResume).unwrap();
     assert!(matches!(h.audio.try_recv().unwrap(), AudioCommand::Resume));
     assert!(h.audio.try_recv().is_err());
     assert_eq!(h.app.generation, generation);
@@ -397,7 +453,7 @@ async fn disconnected_output_notification_resumes_without_reloading_track() {
     });
     h.app.update_playback().unwrap();
     assert_eq!(h.app.state.status, "Ready");
-    h.app.store.close().await;
+    h.store.close().await;
 }
 
 #[tokio::test]
@@ -406,7 +462,7 @@ async fn manual_next_ignores_stale_completion_without_losing_new_completion() {
     h.app.state.queue = vec![track(1), track(2), track(3)].into();
     h.app.play_index(0).unwrap();
     let old_generation = h.app.generation;
-    h.app.handle(AppCommand::Next).await.unwrap();
+    h.app.handle(PlaybackCommand::Next).unwrap();
     let new_generation = h.app.generation;
     assert_ne!(old_generation, new_generation);
     h.audio.try_iter().for_each(drop);
@@ -441,7 +497,7 @@ async fn manual_next_ignores_stale_completion_without_losing_new_completion() {
         AudioCommand::SetNext(None)
     ));
     assert!(h.audio.try_recv().is_err());
-    h.app.store.close().await;
+    h.store.close().await;
 }
 
 #[tokio::test]
@@ -464,7 +520,7 @@ async fn duplicate_queue_entries_advance_by_completion_and_replacement_invalidat
         matches!(h.audio.try_recv().unwrap(), AudioCommand::SetNext(Some(next)) if next.id == 2)
     );
 
-    h.app.handle(AppCommand::Play(track(7))).await.unwrap();
+    h.app.handle(PlaybackCommand::Play(track(7))).unwrap();
     h.audio.try_iter().for_each(drop);
     h.playback.send_replace(PlaybackSnapshot {
         generation: old_generation,
@@ -477,7 +533,7 @@ async fn duplicate_queue_entries_advance_by_completion_and_replacement_invalidat
     assert_eq!(h.app.state.queue.as_ref(), &vec![track(7)]);
     assert_eq!(h.app.state.queue_index, Some(0));
     assert!(h.audio.try_recv().is_err());
-    h.app.store.close().await;
+    h.store.close().await;
 }
 
 #[tokio::test]
@@ -487,7 +543,7 @@ async fn stop_invalidates_in_flight_completion_without_restarting_queue() {
     h.app.play_index(0).unwrap();
     let old_generation = h.app.generation;
     h.audio.try_iter().for_each(drop);
-    h.app.handle(AppCommand::Stop).await.unwrap();
+    h.app.handle(PlaybackCommand::Stop).unwrap();
     assert!(
         matches!(h.audio.try_recv().unwrap(), AudioCommand::Stop { generation } if generation != old_generation)
     );
@@ -501,7 +557,7 @@ async fn stop_invalidates_in_flight_completion_without_restarting_queue() {
     h.app.update_playback().unwrap();
     assert_eq!(h.app.state.queue_index, Some(0));
     assert!(h.audio.try_recv().is_err());
-    h.app.store.close().await;
+    h.store.close().await;
 }
 
 #[tokio::test]
@@ -510,14 +566,17 @@ async fn rejected_play_command_preserves_queue_and_generation() {
     h.app.state.queue = vec![track(1)].into();
     h.app.state.queue_index = Some(0);
     let (sender, _receiver) = sync_channel(1);
-    sender.try_send(AudioCommand::SetVolume(1.0)).unwrap();
+    sender
+        .try_send(TraceContext::new(&"fill").wrap(AudioCommand::SetVolume(1.0)))
+        .unwrap();
     h.app.audio = sender;
-    h.app.pending_audio = (0..64).map(|_| AudioCommand::Pause).collect();
+    h.app.pending_audio = (0..64)
+        .map(|_| TraceContext::new(&"fill").wrap(AudioCommand::Pause))
+        .collect();
     let generation = h.app.generation;
     assert!(
         h.app
-            .handle(AppCommand::Play(track(2)))
-            .await
+            .handle(PlaybackCommand::Play(track(2)))
             .unwrap_err()
             .to_string()
             .contains("busy")
@@ -525,14 +584,17 @@ async fn rejected_play_command_preserves_queue_and_generation() {
     assert_eq!(h.app.state.queue.as_ref(), &vec![track(1)]);
     assert_eq!(h.app.state.queue_index, Some(0));
     assert_eq!(h.app.generation, generation);
-    h.app.store.close().await;
+    h.store.close().await;
 }
 
 #[tokio::test]
 async fn full_audio_channel_retries_in_order_and_coalesces_seeks() {
     let mut h = Harness::new().await;
     let (sender, receiver) = sync_channel(1);
-    sender.try_send(AudioCommand::SetVolume(0.9)).unwrap();
+    let receiver = AudioMessages(receiver);
+    sender
+        .try_send(TraceContext::new(&"fill").wrap(AudioCommand::SetVolume(0.9)))
+        .unwrap();
     h.app.audio = sender;
     h.app.send_audio(AudioCommand::Pause).unwrap();
     h.app
@@ -564,54 +626,57 @@ async fn full_audio_channel_retries_in_order_and_coalesces_seeks() {
     ));
     assert!(h.app.pending_audio.is_empty());
     assert!(receiver.try_recv().is_err());
-    h.app.store.close().await;
+    h.store.close().await;
 }
 
 #[tokio::test]
 async fn stale_audio_volume_acknowledgment_does_not_overwrite_requested_volume() {
     let mut h = Harness::new().await;
-    h.app.handle(AppCommand::SetVolume(0.35)).await.unwrap();
+    h.app.handle(PlaybackCommand::SetVolume(0.35)).unwrap();
     h.playback.send_replace(PlaybackSnapshot {
         volume: 1.0,
         generation: h.app.generation,
         ..Default::default()
     });
     h.app.update_playback().unwrap();
-    h.app.persist_volume().await.unwrap();
+    h.persisted_volume(h.app.requested_volume).await;
     assert_eq!(h.app.state.playback.volume, 0.35);
     assert_eq!(
-        h.app.store.get_setting("volume").await.unwrap().as_deref(),
+        h.store.get_setting("volume").await.unwrap().as_deref(),
         Some("0.35")
     );
-    h.app.store.close().await;
+    h.store.close().await;
 }
 
 #[tokio::test]
 async fn settings_restore_and_volume_validation_use_persisted_values() {
     let mut h = Harness::new().await;
-    h.app.store.set_setting("volume", "NaN").await.unwrap();
-    h.app
-        .store
+    h.store.set_setting("volume", "NaN").await.unwrap();
+    h.store
         .set_setting("output_device", "Test DAC")
         .await
         .unwrap();
-    h.app.restore().await.unwrap();
+    let restored = settings::restore(&h.store).await.unwrap();
+    h.app
+        .send_audio(AudioCommand::SetVolume(restored.volume))
+        .unwrap();
+    h.app
+        .send_audio(AudioCommand::SetDevice(restored.device))
+        .unwrap();
     assert_eq!(h.app.state.playback.state, PlaybackState::Stopped);
     assert!(matches!(h.audio.try_recv().unwrap(), AudioCommand::SetVolume(value) if value == 1.0));
     assert!(
         matches!(h.audio.try_recv().unwrap(), AudioCommand::SetDevice(Some(name)) if name == "Test DAC")
     );
-    h.app.handle(AppCommand::SetVolume(f32::NAN)).await.unwrap();
+    h.app.handle(PlaybackCommand::SetVolume(f32::NAN)).unwrap();
     assert!(h.audio.try_recv().is_err());
-    assert!(!h.app.volume_dirty);
-    h.app.handle(AppCommand::SetVolume(-0.4)).await.unwrap();
-    h.app.persist_volume().await.unwrap();
+    h.app.handle(PlaybackCommand::SetVolume(-0.4)).unwrap();
+    h.persisted_volume(h.app.requested_volume).await;
     assert_eq!(
-        h.app.store.get_setting("volume").await.unwrap().as_deref(),
+        h.store.get_setting("volume").await.unwrap().as_deref(),
         Some("0")
     );
-    assert!(!h.app.volume_dirty);
-    h.app.store.close().await;
+    h.store.close().await;
 }
 
 #[tokio::test]
@@ -630,10 +695,10 @@ async fn final_scan_progress_is_published_after_progress_sender_closes() {
     });
     sender.send_replace(final_progress.clone());
     drop(sender);
-    h.app.scan_progress = Some(receiver);
-    h.app.scan_task = Some(tokio::spawn(async { Ok(()) }));
-    let store = h.app.store.clone();
-    let task = tokio::spawn(h.app.run());
+    h.library.scan_progress = Some(receiver);
+    h.library.scan_task = Some(tokio::spawn(async { Ok(()) }));
+    let store = h.store.clone();
+    let task = tokio::spawn(h.library.run(h.shutdown.clone()));
     wait_for(&mut h.snapshots, |state| {
         state.status.starts_with("Scan complete:")
     })
@@ -657,10 +722,12 @@ async fn import_scan_publishes_folder_error_and_targeted_retry() {
     for name in ["first.flac", "second.mp3", "third.ogg", "broken.wav"] {
         std::fs::write(root.join(name), b"fixture").unwrap();
     }
-    let store = h.app.store.clone();
-    let task = tokio::spawn(h.app.run());
+    let store = h.store.clone();
+    let task = tokio::spawn(h.library.run(h.shutdown.clone()));
     h.commands
-        .send(AppCommand::Import(vec![root.clone()]))
+        .send(AppCommand::Library(LibraryCommand::Import(vec![
+            root.clone(),
+        ])))
         .await
         .unwrap();
     wait_for(&mut h.snapshots, |state| {
@@ -679,7 +746,7 @@ async fn import_scan_publishes_folder_error_and_targeted_retry() {
     assert_eq!(snapshot.roots.len(), 1);
     std::fs::remove_file(root.join("broken.wav")).unwrap();
     h.commands
-        .send(AppCommand::RescanFolder(folder_id))
+        .send(AppCommand::Library(LibraryCommand::RescanFolder(folder_id)))
         .await
         .unwrap();
     wait_for(&mut h.snapshots, |state| {
@@ -710,15 +777,19 @@ async fn folders_added_during_a_scan_are_imported_automatically_after_it_finishe
             .unwrap();
     }
     let (finish, finished) = tokio::sync::oneshot::channel();
-    h.app.scan_task = Some(tokio::spawn(async move {
+    h.library.scan_task = Some(tokio::spawn(async move {
         finished.await?;
         Ok(())
     }));
-    h.app.state.scan.running = true;
-    let store = h.app.store.clone();
-    let task = tokio::spawn(h.app.run());
+    h.library.state.scan.running = true;
+    let store = h.store.clone();
+    let task = tokio::spawn(h.library.run(h.shutdown.clone()));
     h.commands
-        .send(AppCommand::Import(vec![first.clone(), second, first]))
+        .send(AppCommand::Library(LibraryCommand::Import(vec![
+            first.clone(),
+            second,
+            first,
+        ])))
         .await
         .unwrap();
     wait_for(&mut h.snapshots, |state| state.queued_imports == 2).await;
@@ -743,68 +814,80 @@ async fn folders_added_during_a_scan_are_imported_automatically_after_it_finishe
 async fn cancelling_scans_clears_folders_queued_by_the_ui() {
     let mut h = Harness::new().await;
     let release = start_blocked_scan(&mut h).await;
-    h.app
-        .handle(AppCommand::Import(vec![PathBuf::from("another-folder")]))
+    h.library
+        .handle(LibraryCommand::Import(vec![PathBuf::from(
+            "another-folder",
+        )]))
         .await
         .unwrap();
-    assert_eq!(h.app.state.queued_imports, 1);
-    h.app.handle(AppCommand::CancelScan).await.unwrap();
-    assert_eq!(h.app.state.queued_imports, 0);
-    assert!(h.app.pending_imports.is_empty());
-    assert!(h.app.scan_cancel.is_none());
-    h.app.handle(AppCommand::CancelScan).await.unwrap();
-    assert!(h.app.scan_task.take().unwrap().await.unwrap().is_err());
-    assert!(!h.app.scan_progress.as_ref().unwrap().borrow().running);
+    assert_eq!(h.library.state.queued_imports, 1);
+    h.library.handle(LibraryCommand::CancelScan).await.unwrap();
+    assert_eq!(h.library.state.queued_imports, 0);
+    assert!(h.library.pending_imports.is_empty());
+    assert!(h.library.scan_cancel.is_none());
+    h.library.handle(LibraryCommand::CancelScan).await.unwrap();
+    assert!(h.library.scan_task.take().unwrap().await.unwrap().is_err());
+    assert!(!h.library.scan_progress.as_ref().unwrap().borrow().running);
     let _ = release.send(());
-    h.app.store.close().await;
+    h.store.close().await;
 }
 
 #[tokio::test]
 async fn full_scan_queue_rejects_new_paths_without_losing_accepted_folders() {
     let mut h = Harness::new().await;
-    h.app.scan_task = Some(tokio::spawn(std::future::pending()));
+    h.library.scan_task = Some(tokio::spawn(std::future::pending()));
     let paths: Vec<_> = (0..64)
         .map(|index| PathBuf::from(format!("folder-{index}")))
         .collect();
-    h.app
-        .handle(AppCommand::Import(paths.clone()))
+    h.library
+        .handle(LibraryCommand::Import(paths.clone()))
         .await
         .unwrap();
     assert!(
-        h.app
-            .handle(AppCommand::Import(vec![PathBuf::from("overflow")]))
+        h.library
+            .handle(LibraryCommand::Import(vec![PathBuf::from("overflow")]))
             .await
             .is_err()
     );
-    assert_eq!(h.app.pending_imports, paths);
-    assert_eq!(h.app.state.queued_imports, 64);
-    h.app.scan_task.take().unwrap().abort();
-    h.app.store.close().await;
+    assert_eq!(h.library.pending_imports, paths);
+    assert_eq!(h.library.state.queued_imports, 64);
+    h.library.scan_task.take().unwrap().abort();
+    h.store.close().await;
 }
 
 #[tokio::test]
 async fn shutdown_flushes_volume_and_cooperatively_joins_scan() {
     let mut h = Harness::new().await;
     let release = start_blocked_scan(&mut h).await;
-    let progress = h.app.scan_progress.as_ref().unwrap().clone();
-    let store = h.app.store.clone();
-    let task = tokio::spawn(h.app.run());
-    h.commands.send(AppCommand::SetVolume(0.35)).await.unwrap();
-    wait_for(&mut h.snapshots, |state| state.playback.volume == 0.35).await;
-    h.commands.send(AppCommand::Shutdown).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), task)
+    let progress = h.library.scan_progress.as_ref().unwrap().clone();
+    let player = tokio::spawn(h.app.run(h.shutdown.clone()));
+    let library = tokio::spawn(h.library.run(h.shutdown.clone()));
+    h.commands
+        .send(PlaybackCommand::SetVolume(0.35).into())
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
+    wait_for(&mut h.player_snapshots, |state| {
+        state.playback.volume == 0.35
+    })
+    .await;
+    h.commands.0.shutdown();
+    player.await.unwrap().unwrap();
+    library.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while h.settings.borrow().volume != 0.35 {
+            h.settings.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
     assert!(!progress.borrow().running);
     assert!(progress.has_changed().is_err());
     let _ = release.send(());
     assert_eq!(
-        store.get_setting("volume").await.unwrap().as_deref(),
+        h.store.get_setting("volume").await.unwrap().as_deref(),
         Some("0.35")
     );
-    store.close().await;
+    h.store.close().await;
 }
 
 async fn start_blocked_scan(h: &mut Harness) -> std::sync::mpsc::Sender<()> {
@@ -828,16 +911,16 @@ async fn start_blocked_scan(h: &mut Harness) -> std::sync::mpsc::Sender<()> {
     std::fs::write(root.join("track.flac"), b"fixture").unwrap();
     let started = Arc::new(tokio::sync::Notify::new());
     let (release, receiver) = std::sync::mpsc::channel();
-    h.app.probe = Arc::new(BlockingProbe {
+    h.library.probe = Arc::new(BlockingProbe {
         started: Arc::clone(&started),
         release: std::sync::Mutex::new(receiver),
     });
-    h.app.start_scan(vec![root]).await.unwrap();
+    h.library.start_scan(vec![root]).await.unwrap();
     tokio::time::timeout(Duration::from_secs(3), started.notified())
         .await
         .unwrap();
-    assert!(h.app.scan_cancel.is_some());
-    assert!(!h.app.scan_task.as_ref().unwrap().is_finished());
+    assert!(h.library.scan_cancel.is_some());
+    assert!(!h.library.scan_task.as_ref().unwrap().is_finished());
     release
 }
 
@@ -845,9 +928,12 @@ async fn start_blocked_scan(h: &mut Harness) -> std::sync::mpsc::Sender<()> {
 async fn cancelled_scan_publishes_final_progress_and_cancelled_status() {
     let mut h = Harness::new().await;
     let release = start_blocked_scan(&mut h).await;
-    let store = h.app.store.clone();
-    let task = tokio::spawn(h.app.run());
-    h.commands.send(AppCommand::CancelScan).await.unwrap();
+    let store = h.store.clone();
+    let task = tokio::spawn(h.library.run(h.shutdown.clone()));
+    h.commands
+        .send(AppCommand::Library(LibraryCommand::CancelScan))
+        .await
+        .unwrap();
     wait_for(&mut h.snapshots, |state| state.status == "Scan cancelled").await;
     assert!(!h.snapshots.borrow().scan.running);
     h.commands.send(AppCommand::Shutdown).await.unwrap();
@@ -894,12 +980,10 @@ async fn rapid_skips_keep_artwork_reads_bounded_and_discard_stale_results() {
             self.0.released.store(true, Ordering::SeqCst);
         }
     }
-    let mut h = Harness::new().await;
     let probe = Arc::new(SlowProbe::default());
     let _release = ReleaseOnDrop(Arc::clone(&probe));
-    h.app.probe = probe.clone();
-    h.app.state.playback.track = Some(track(1));
-    h.app.refresh_artwork();
+    let mut cover = CoverHarness::new(probe.clone());
+    cover.set(Some(track(1)));
     tokio::time::timeout(Duration::from_secs(3), async {
         while probe.starts.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -908,22 +992,15 @@ async fn rapid_skips_keep_artwork_reads_bounded_and_discard_stale_results() {
     .await
     .unwrap();
     for id in 2..100 {
-        h.app.state.playback.track = Some(track(id));
-        h.app.refresh_artwork();
+        cover.set(Some(track(id)));
     }
+    wait_for(&mut cover.state, |state| state.path == Some(track(99).path)).await;
     assert_eq!(probe.starts.load(Ordering::SeqCst), 1);
+    assert!(cover.state.borrow().artwork.is_none());
     probe.released.store(true, Ordering::SeqCst);
-    h.app.finish_artwork().await;
-    assert!(
-        h.app.state.artwork.is_none(),
-        "old track cover must not be published"
-    );
-    h.app.finish_artwork().await;
-    let artwork = h.app.state.artwork.as_ref().unwrap();
-    assert_eq!(&*artwork.data, b"track-99.flac");
+    cover.expect(Some(b"track-99.flac")).await;
     assert_eq!(probe.starts.load(Ordering::SeqCst), 2);
     assert_eq!(probe.peak.load(Ordering::SeqCst), 1);
-    h.app.store.close().await;
 }
 
 #[tokio::test]
@@ -946,55 +1023,38 @@ async fn artwork_reads_keep_the_current_cover_until_replacement_or_confirmed_abs
             }))
         }
     }
-    let mut h = Harness::new().await;
-    h.app.probe = Arc::new(ArtworkProbe);
-    h.app.state.playback.track = Some(track(1));
-    h.app.refresh_artwork();
-    h.app.finish_artwork().await;
-    let first = h.app.state.artwork.as_ref().unwrap().data.clone();
-    h.app.state.playback.track = Some(track(2));
-    h.app.refresh_artwork();
+    let mut cover = CoverHarness::new(Arc::new(ArtworkProbe));
+    cover.set(Some(track(1)));
+    cover.expect(Some(b"track-1.flac")).await;
+    let first = cover.state.borrow().artwork.as_ref().unwrap().data.clone();
+    cover.set(Some(track(2)));
     assert!(Arc::ptr_eq(
-        &h.app.state.artwork.as_ref().unwrap().data,
+        &cover.state.borrow().artwork.as_ref().unwrap().data,
         &first
     ));
-    h.app.finish_artwork().await;
-    assert_eq!(
-        h.app.state.artwork.as_ref().unwrap().data.as_ref(),
-        b"track-2.flac"
-    );
+    cover.expect(Some(b"track-2.flac")).await;
     for id in [3, 4] {
-        h.app.state.playback.track = Some(track(1));
-        h.app.refresh_artwork();
-        h.app.finish_artwork().await;
-        let previous = h.app.state.artwork.clone();
-        h.app.state.playback.track = Some(track(id));
-        h.app.refresh_artwork();
-        assert_eq!(
-            h.app.state.artwork.as_ref().map(|art| &art.data),
-            previous.as_ref().map(|art| &art.data)
-        );
-        h.app.finish_artwork().await;
-        assert!(h.app.state.artwork.is_none());
+        cover.set(Some(track(1)));
+        cover.expect(Some(b"track-1.flac")).await;
+        let previous = cover.state.borrow().artwork.clone();
+        cover.set(Some(track(id)));
+        assert_eq!(cover.state.borrow().artwork, previous);
+        cover.expect(None).await;
     }
-    h.app.state.playback.track = Some(track(1));
-    h.app.refresh_artwork();
-    h.app.finish_artwork().await;
-    h.app.state.playback.track = None;
-    h.app.refresh_artwork();
-    assert!(h.app.state.artwork.is_none());
-    h.app.store.close().await;
+    cover.set(Some(track(1)));
+    cover.expect(Some(b"track-1.flac")).await;
+    cover.set(None);
+    cover.expect(None).await;
 }
 
 #[tokio::test]
 async fn seek_request_identity_survives_forwarding_and_snapshot_updates() {
     let mut h = Harness::new().await;
     h.app
-        .handle(AppCommand::Seek {
+        .handle(PlaybackCommand::Seek {
             position_ms: 5000,
             request_id: 17,
         })
-        .await
         .unwrap();
     assert!(matches!(
         h.audio.try_recv().unwrap(),
@@ -1012,5 +1072,39 @@ async fn seek_request_identity_survives_forwarding_and_snapshot_updates() {
     h.app.update_playback().unwrap();
     assert_eq!(h.app.state.playback.seek_request_id, 17);
     assert_eq!(h.app.state.playback.position_ms, 5100);
-    h.app.store.close().await;
+    h.store.close().await;
+}
+
+struct CoverHarness {
+    player: watch::Sender<PlayerSnapshot>,
+    state: watch::Receiver<ArtworkSnapshot>,
+    _task: TaskGuard,
+    _shutdown: watch::Sender<bool>,
+}
+impl CoverHarness {
+    fn new(probe: Arc<dyn MetadataProbe>) -> Self {
+        let (player, input) = watch::channel(PlayerSnapshot::default());
+        let (output, state) = watch::channel(ArtworkSnapshot::default());
+        let (_, requests) = mpsc::channel(64);
+        let (stop, shutdown) = watch::channel(false);
+        let task = TaskGuard(tokio::spawn(artwork::run(
+            probe, input, requests, output, shutdown,
+        )));
+        Self {
+            player,
+            state,
+            _task: task,
+            _shutdown: stop,
+        }
+    }
+    fn set(&self, track: Option<Track>) {
+        self.player
+            .send_modify(|state| state.playback.track = track);
+    }
+    async fn expect(&mut self, data: Option<&[u8]>) {
+        wait_for(&mut self.state, |state| {
+            state.artwork.as_ref().map(|art| art.data.as_ref()) == data
+        })
+        .await;
+    }
 }

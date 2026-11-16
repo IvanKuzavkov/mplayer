@@ -27,7 +27,7 @@ impl PlayerApp {
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
         buttons.spacing_mut().item_spacing.x = 8.0;
-        let enabled = self.available() && has_tracks;
+        let enabled = self.playback_available() && self.available() && has_tracks;
         let enqueue = icon_buttons::icon_buttons(
             &mut buttons,
             icon_buttons::Icon::Queue,
@@ -43,10 +43,10 @@ impl PlayerApp {
         #[cfg(test)]
         self.album_action_buttons.push([enqueue.rect, play.rect]);
         if enqueue.clicked() {
-            self.submit(AppCommand::EnqueueAlbum(key.clone()));
+            self.submit(PlaybackCommand::EnqueueAlbum(key.clone()));
         }
         if play.clicked() {
-            self.submit(AppCommand::PlayAlbum(key.clone()));
+            self.submit(PlaybackCommand::PlayAlbum(key.clone()));
         }
         ui.rect_contains_pointer(bar)
     }

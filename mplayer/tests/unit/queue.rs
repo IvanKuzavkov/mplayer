@@ -24,17 +24,7 @@ async fn clearing_queue_resets_player_immediately_and_ignores_late_updates() {
         ..Default::default()
     };
     h.app.state.playback = previous.clone();
-    let path = track(1).path;
-    h.app.artwork_track = Some(path.clone());
-    h.app.artwork_reading = Some(path.clone());
-    h.app.state.artwork = Some(Artwork {
-        data: b"previous cover".as_slice().into(),
-        mime_type: "test/data".into(),
-    });
-    let (sender, result) = tokio::sync::oneshot::channel();
-    h.app.artwork_task = Some(tokio::spawn(async { result.await.unwrap() }));
-
-    h.app.handle(AppCommand::ClearQueue).await.unwrap();
+    h.app.handle(PlaybackCommand::ClearQueue).unwrap();
     assert!(h.app.state.queue.is_empty());
     assert!(h.app.state.queue_index.is_none());
     let playback = &h.app.state.playback;
@@ -49,8 +39,6 @@ async fn clearing_queue_resets_player_immediately_and_ignores_late_updates() {
     assert_eq!(playback.volume, previous.volume);
     assert_eq!(playback.selected_device, previous.selected_device);
     assert_eq!(playback.devices, previous.devices);
-    assert!(h.app.state.artwork.is_none());
-    assert!(h.app.artwork_track.is_none());
     assert_eq!(h.app.state.status, "Ready");
     assert!(
         matches!(h.audio.try_recv().unwrap(), AudioCommand::Stop { generation } if generation == h.app.generation && generation != old_generation)
@@ -58,20 +46,9 @@ async fn clearing_queue_resets_player_immediately_and_ignores_late_updates() {
 
     h.playback.send_replace(previous);
     h.app.update_playback().unwrap();
-    sender
-        .send((
-            path,
-            Ok(Some(Artwork {
-                data: b"late cover".as_slice().into(),
-                mime_type: "test/data".into(),
-            })),
-        ))
-        .unwrap();
-    h.app.finish_artwork().await;
     assert!(h.app.state.playback.track.is_none());
     assert_eq!(h.app.state.playback.state, PlaybackState::Stopped);
-    assert!(h.app.state.artwork.is_none());
     assert!(h.app.state.queue.is_empty());
     assert!(h.audio.try_recv().is_err());
-    h.app.store.close().await;
+    h.store.close().await;
 }

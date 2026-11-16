@@ -25,8 +25,8 @@ fn folder_and_playlist_lists_share_track_row_backgrounds() {
             (View::ScanFolders, LibraryTab::Tracks),
             (View::Playlists, LibraryTab::Tracks),
         ] {
-            let (sender, _receiver) = mpsc::channel(64);
-            let (_state, snapshots) = watch::channel(snapshot.clone());
+            let (sender, _receiver) = command_channel(64);
+            let (_state, snapshots) = snapshot_channel(snapshot.clone());
             let mut app = PlayerApp::new(sender, snapshots);
             app.view = view;
             app.tab = tab;
@@ -60,8 +60,8 @@ fn scan_folder_minus_removes_its_own_path_and_obeys_scan_and_import_guards() {
     for size in [[950.0, 620.0], [1150.0, 760.0]] {
         let mut snapshot = populated();
         snapshot.roots = vec!["/music/first".into(), "/music/second".into()];
-        let (sender, mut receiver) = mpsc::channel(64);
-        let (state, snapshots) = watch::channel(snapshot);
+        let (sender, mut receiver) = command_channel(64);
+        let (state, snapshots) = snapshot_channel(snapshot);
         let mut app = PlayerApp::new(sender, snapshots);
         app.view = View::ScanFolders;
         let context = egui::Context::default();
@@ -71,7 +71,7 @@ fn scan_folder_minus_removes_its_own_path_and_obeys_scan_and_import_guards() {
         assert_eq!(minus.size(), egui::vec2(28.0, 28.0));
         click_at(&mut app, &context, size, minus.center());
         assert!(
-            matches!(receiver.try_recv(), Ok(AppCommand::RemoveScanFolder(path)) if path == std::path::Path::new("/music/second"))
+            matches!(receiver.try_recv(), Ok(AppCommand::Library(LibraryCommand::RemoveScanFolder(path))) if path == std::path::Path::new("/music/second"))
         );
         assert!(receiver.try_recv().is_err());
         for (running, queued) in [(true, 0), (false, 1)] {

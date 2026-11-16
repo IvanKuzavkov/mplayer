@@ -510,7 +510,7 @@ fn metadata_artwork_and_invalid_tags_do_not_change_audio() {
     ];
     for data in files {
         let file = Fixture::new(&data, "dsf");
-        let probe = crate::SymphoniaProbe;
+        let probe = crate::metadata_probe();
         let metadata = probe.probe(&file.0).unwrap();
         assert_eq!(
             (
@@ -533,7 +533,7 @@ fn metadata_artwork_and_invalid_tags_do_not_change_audio() {
         let file = Fixture::new(&dsf(2_822_400, 2, 4704 * 8, true, &raw, tag), "dsf");
         let mut decoder = Decoder::open(&file.0).unwrap();
         assert_eq!(decode(&mut decoder).len(), 2352 * 2);
-        assert!(crate::SymphoniaProbe.artwork(&file.0).unwrap().is_none());
+        assert!(crate::metadata_probe().artwork(&file.0).unwrap().is_none());
     }
     let mut info = Vec::new();
     for (id, text) in [
@@ -548,7 +548,7 @@ fn metadata_artwork_and_invalid_tags_do_not_change_audio() {
         &dff(2_822_400, 2, &raw, None, false, &chunk(b"DIIN", &info)),
         "dff",
     );
-    let metadata = crate::SymphoniaProbe.probe(&file.0).unwrap();
+    let metadata = crate::metadata_probe().probe(&file.0).unwrap();
     assert_eq!(
         (metadata.title.as_str(), metadata.artist.as_str()),
         ("Title", "Artist")

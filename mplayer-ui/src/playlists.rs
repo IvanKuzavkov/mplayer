@@ -24,7 +24,7 @@ impl PlayerApp {
             self.back_button = Some(back.rect);
         }
         if back.clicked() {
-            self.submit(AppCommand::SelectPlaylist(None));
+            self.submit(LibraryCommand::SelectPlaylist(None));
         }
         ui.add_space(8.0);
         let (header, _) =
@@ -66,7 +66,8 @@ impl PlayerApp {
         let play = icon_buttons::icon_buttons(
             &mut button_ui,
             icon_buttons::Icon::PlaySmall,
-            self.available()
+            self.playback_available()
+                && self.available()
                 && state
                     .playlist_entries
                     .iter()
@@ -78,7 +79,7 @@ impl PlayerApp {
             self.playlist_play = Some(play.rect);
         }
         if play.clicked() {
-            self.submit(AppCommand::PlayPlaylist(playlist.id));
+            self.submit(PlaybackCommand::PlayPlaylist(playlist.id));
         }
         ui.add_space(10.0);
         ui.separator();
@@ -152,7 +153,7 @@ impl PlayerApp {
                                         egui::Stroke::new(2.0, theme::accent(ui.visuals())),
                                     );
                                     if response.dnd_release_payload::<PlaylistDrag>().is_some() {
-                                        self.submit(AppCommand::MovePlaylistEntry {
+                                        self.submit(LibraryCommand::MovePlaylistEntry {
                                             entry_id: drag.entry_id,
                                             position,
                                         });
@@ -210,7 +211,7 @@ impl PlayerApp {
                             .any(|playlist| playlist.name.trim().eq_ignore_ascii_case(name))
                         {
                             self.rejected_playlist_name = Some(self.playlist_name.clone());
-                        } else if self.submit(AppCommand::CreatePlaylist(name.into())) {
+                        } else if self.submit(LibraryCommand::CreatePlaylist(name.into())) {
                             self.playlist_name.clear();
                             self.rejected_playlist_name = None;
                         }
@@ -259,7 +260,7 @@ impl PlayerApp {
                                 )
                                 .clicked()
                                 {
-                                    self.submit(AppCommand::SelectPlaylist(Some(playlist.id)));
+                                    self.submit(LibraryCommand::SelectPlaylist(Some(playlist.id)));
                                 }
                                 let mut buttons = ui.new_child(egui::UiBuilder::new().max_rect(
                                     egui::Rect::from_center_size(
@@ -276,7 +277,7 @@ impl PlayerApp {
                                 #[cfg(test)]
                                 self.playlist_remove.push(remove.rect);
                                 if remove.clicked() {
-                                    self.submit(AppCommand::DeletePlaylist(playlist.id));
+                                    self.submit(LibraryCommand::DeletePlaylist(playlist.id));
                                 }
                             });
                         }

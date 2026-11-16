@@ -51,7 +51,7 @@ impl PlayerApp {
                         self.scan_actions[1] = Some(rescan.rect);
                     }
                     if rescan.clicked() {
-                        self.submit(AppCommand::Rescan);
+                        self.submit(LibraryCommand::Rescan);
                     }
                     if state.scan.running {
                         ui.spinner();
@@ -61,7 +61,7 @@ impl PlayerApp {
                                 .color(ui.visuals().weak_text_color()),
                         );
                         if ui.small_button("Cancel").clicked() {
-                            self.submit(AppCommand::CancelScan);
+                            self.submit(LibraryCommand::CancelScan);
                         }
                     } else {
                         ui.label(
@@ -116,7 +116,7 @@ impl PlayerApp {
                                 #[cfg(test)]
                                 self.scan_remove.push(remove.rect);
                                 if remove.clicked() {
-                                    self.submit(AppCommand::RemoveScanFolder(path.clone()));
+                                    self.submit(LibraryCommand::RemoveScanFolder(path.clone()));
                                 }
                             });
                         }

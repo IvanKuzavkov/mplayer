@@ -71,6 +71,22 @@ Application events default to `info`, dependencies to `warn`. Enable debug spans
 RUST_LOG=warn,mplayer=debug,mplayer_core=debug,mplayer_audio=debug,mplayer_ui=debug cargo run --release --locked -p mplayer
 ```
 
+To trace commands while retaining normal application logging, enable only the
+command target at debug level:
+
+```sh
+RUST_LOG=warn,mplayer=info,mplayer_core=info,mplayer_audio=info,mplayer_ui=info,mplayer::commands=debug cargo run --locked -p mplayer
+```
+
+Each logical command has a `trace_id` consisting of a process-run identifier and
+a counter. Search the JSON log for that ID to follow dispatch, handling, audio
+commands, background work and failures. Retries retain their ID; coalescing and
+supersession record the replacement ID. `dispatched` means inbox acceptance;
+`handled`, `resolved` and `persisted_*` identify completion in a particular
+component. Imports merged into one scan record its `batch_trace_id` and report
+completion for each originating command. Command tracing is disabled by the
+default filter.
+
 Playback diagnostics report position, PCM queue depth, callback intervals, and
 application/device underrun counts every five seconds. Paths and track identifiers
 can appear in logs. Logging runs outside audio callbacks through a bounded writer;
@@ -110,6 +126,26 @@ analysis filter and fits one delay and gain per window. `report.json` contains
 overall and local 10 ms differences. These comparisons are descriptive: different
 DSD filters need not produce identical samples. The self-test checks alignment,
 gain fitting, silence, and detection of an injected 5 ms gap.
+
+## Component communication
+
+`Application` constructs and supervises playback, library/scanning, settings and
+artwork services. `CommandRouter` sends typed commands directly to bounded
+service inboxes; playback and library have independent UI retry queues. Commands
+carry their trace context across channels and worker boundaries.
+
+Each service owns its state and publishes changes through `watch` subscriptions.
+The UI combines these snapshots locally and requests repaint only on updates.
+Library lookups use individual replies, allowing playback controls to continue
+while an album loads. A newer Play or Stop invalidates a pending start; queued
+additions retain order. Generation counters protect playback and artwork from
+stale results and coalesced updates.
+
+`mplayer_audio::metadata_probe()` creates the stateless metadata/artwork reader.
+Startup shares it with scanning and artwork workers through `MetadataProbe`;
+tests inject their own probes. Image decoding and textures remain in the UI.
+Settings writes run independently of playback and flush accepted preferences
+during shutdown. The audio decoder and output retain their dedicated thread.
 
 ## Audio implementation notes
 
