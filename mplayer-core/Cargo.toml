@@ -4,7 +4,6 @@ version = "0.1.1"
 edition = "2024"
 
 [dependencies]
-test-log.workspace = true
 libsqlite3-sys = "=0.37"
 sqlx = { version = "0.9", features = [
     "runtime-tokio",
@@ -13,7 +12,9 @@ sqlx = { version = "0.9", features = [
     "migrate",
 ] }
 dirwalk = "1.1"
+cuna = "0.7"
+rand.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
-cuna = "0.7"
+test-log.workspace = true

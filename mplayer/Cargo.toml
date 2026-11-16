@@ -8,6 +8,7 @@ directories = "6.0.0"
 mplayer-audio = { version = "0.1.0", path = "../mplayer-audio" }
 mplayer-core = { version = "0.1.0", path = "../mplayer-core" }
 mplayer-ui = { version = "0.1.0", path = "../mplayer-ui" }
+rand.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true

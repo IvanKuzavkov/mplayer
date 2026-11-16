@@ -4,8 +4,11 @@ version = "0.1.1"
 edition = "2024"
 
 [dependencies]
-eframe = {version = "0.37"}
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+eframe = { version = "0.37" }
+image = { version = "0.25.10", default-features = false, features = [
+    "png",
+    "jpeg",
+] }
 mplayer-core = { version = "0.1.0", path = "../mplayer-core" }
 rfd = "0.17.2"
 tokio.workspace = true

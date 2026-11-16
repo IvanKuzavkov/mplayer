@@ -5,7 +5,6 @@ use std::{
         OnceLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -13,16 +12,16 @@ pub const INBOX_CAPACITY: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TraceId {
-    run: u128,
+    run: u64,
     sequence: u64,
 }
 impl std::fmt::Display for TraceId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{:x}-{:x}-{}",
-            self.run,
+            "{:x}-{:x}:{}",
             std::process::id(),
+            self.run,
             self.sequence
         )
     }
@@ -40,15 +39,10 @@ impl PartialEq for TraceContext {
 }
 impl TraceContext {
     pub fn new(command: &impl std::fmt::Debug) -> Self {
-        static RUN: OnceLock<u128> = OnceLock::new();
+        static RUN: OnceLock<u64> = OnceLock::new();
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let id = TraceId {
-            run: *RUN.get_or_init(|| {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            }),
+            run: *RUN.get_or_init(rand::random),
             sequence: NEXT.fetch_add(1, Ordering::Relaxed),
         };
         let span =

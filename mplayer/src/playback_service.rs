@@ -1,8 +1,8 @@
 use anyhow::{Context, bail};
 use mplayer_core::*;
+use rand::{RngExt, rngs::StdRng};
 use std::{
     collections::VecDeque,
-    hash::{BuildHasher, RandomState},
     sync::{Arc, mpsc::SyncSender},
     time::Duration,
 };
@@ -25,8 +25,7 @@ pub(super) struct PlaybackService {
     pub(super) completed: u64,
     pub(super) generation: u64,
     pub(super) next_queue_index: Option<usize>,
-    shuffle_random: RandomState,
-    shuffle_counter: u64,
+    shuffle_random: StdRng,
     pub(super) requested_volume: f32,
     trace: TraceContext,
     pending: VecDeque<CommandEnvelope<PlaybackCommand>>,
@@ -61,8 +60,7 @@ impl PlaybackService {
             completed: 0,
             generation: 0,
             next_queue_index: None,
-            shuffle_random: RandomState::new(),
-            shuffle_counter: 0,
+            shuffle_random: rand::make_rng(),
             requested_volume: volume,
             trace: TraceContext::new(&"playback_start"),
             pending: VecDeque::new(),
@@ -464,9 +462,7 @@ impl PlaybackService {
             PlayMode::Repeat => Some((current + 1) % len),
             PlayMode::Shuffle if len == 1 => Some(0),
             PlayMode::Shuffle => {
-                self.shuffle_counter = self.shuffle_counter.wrapping_add(1);
-                let index = (self.shuffle_random.hash_one(self.shuffle_counter) % (len - 1) as u64)
-                    as usize;
+                let index = (self.shuffle_random.random_range(0..len - 1) as u64) as usize;
                 Some(if index >= current { index + 1 } else { index })
             }
         }
