@@ -3,6 +3,8 @@
 A desktop music player for local libraries. Browse tracks, folders, and albums;
 build a play queue; and save playlists.
 
+![mplayer with an empty media library](docs/screenshot.png)
+
 ## Run
 
 Build and launch with a current stable Rust toolchain and your platform's
