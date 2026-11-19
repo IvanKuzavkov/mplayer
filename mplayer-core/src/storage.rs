@@ -16,9 +16,13 @@ use crate::{
     PAGE_SIZE, Playlist, PlaylistEntry, Result, ScanStatus, Track, TrackMetadata, TrackSegment,
 };
 
+#[derive(Clone, Default)]
+pub struct QueryComposer;
+
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
+    query_composer: QueryComposer,
 }
 
 #[derive(Clone)]
@@ -27,12 +31,14 @@ pub(crate) struct RootRecord {
     pub path: PathBuf,
     pub generation: i64,
 }
+
 #[derive(Clone)]
 pub(crate) struct FolderRecord {
     pub id: i64,
     pub path: PathBuf,
     pub generation: i64,
 }
+
 #[derive(Clone)]
 pub(crate) struct MediaRecord {
     pub path: PathBuf,
@@ -40,16 +46,19 @@ pub(crate) struct MediaRecord {
     pub file_size: u64,
     pub metadata: TrackMetadata,
 }
+
 pub(crate) struct PreparedTrack {
     pub index: u8,
     pub metadata: TrackMetadata,
     pub segment: Option<crate::TrackSegment>,
     pub cue_path: Option<PathBuf>,
 }
+
 pub(crate) struct PreparedMedia {
     pub media: MediaRecord,
     pub tracks: Vec<PreparedTrack>,
 }
+
 impl PreparedMedia {
     pub fn whole(media: MediaRecord) -> Self {
         let track = PreparedTrack {
@@ -62,6 +71,93 @@ impl PreparedMedia {
             media,
             tracks: vec![track],
         }
+    }
+}
+
+impl QueryComposer {
+    pub const fn tracks_count<'a>(&self) -> &'a str {
+        "SELECT count(*) FROM tracks t JOIN media_tracks m ON m.id=t.media_id JOIN folders f ON f.id=m.folder_id"
+    }
+
+    pub const fn tracks<'a>(&self) -> &'a str {
+        "SELECT t.*, m.path FROM tracks t JOIN media_tracks m ON m.id=t.media_id JOIN folders f ON f.id=m.folder_id"
+    }
+
+    pub const fn folders_count<'a>(&self) -> &'a str {
+        "SELECT count(*) FROM folders WHERE display_path LIKE ? ESCAPE '!'"
+    }
+
+    pub const fn folders<'a>(&self) -> &'a str {
+        r#"SELECT f.*, (SELECT count(*) FROM tracks t JOIN media_tracks m ON m.id=t.media_id
+        WHERE m.folder_id=f.id AND t.missing=0) AS track_count FROM folders f
+        WHERE display_path LIKE ? ESCAPE '!' ORDER BY display_path COLLATE NOCASE, path LIMIT ? OFFSET ?"#
+    }
+
+    pub const fn albums_count<'a>(&self) -> &'a str {
+        r#"SELECT count(*) FROM
+        (SELECT album, COALESCE(NULLIF(album_artist, ''), artist) AS group_artist FROM tracks
+        GROUP BY album, group_artist
+        HAVING album LIKE ? ESCAPE '!' OR group_artist LIKE ? ESCAPE '!')"#
+    }
+
+    pub const fn albums<'a>(&self) -> &'a str {
+        r#"SELECT t.album, COALESCE(NULLIF(t.album_artist, ''), t.artist) AS group_artist,
+                count(*) AS track_count, sum(t.duration_ms) AS duration_ms, min(t.year) AS year,
+                (SELECT m.path FROM tracks a JOIN media_tracks m ON m.id=a.media_id
+                 WHERE a.album=t.album
+                   AND COALESCE(NULLIF(a.album_artist, ''), a.artist)
+                       = COALESCE(NULLIF(t.album_artist, ''), t.artist)
+                   AND a.missing=0
+                 ORDER BY COALESCE(a.disc_number, 1), a.track_number IS NULL,
+                          a.track_number, a.id LIMIT 1) AS artwork_path
+         FROM tracks t GROUP BY t.album, group_artist
+         HAVING t.album LIKE ? ESCAPE '!' OR group_artist LIKE ? ESCAPE '!'
+         ORDER BY t.album COLLATE NOCASE, group_artist COLLATE NOCASE,
+                  t.album, group_artist LIMIT ? OFFSET ?"#
+    }
+
+    const fn folder_query<'a>(&self) -> &'a str {
+        r#"SELECT f.id, f.path, f.scan_folder_id, r.generation
+        FROM folders f JOIN scan_folders r ON r.id = f.scan_folder_id"#
+    }
+
+    pub fn root_folder<DB: sqlx::Database>(&self) -> QueryBuilder<DB> {
+        let mut builder = QueryBuilder::new(self.folder_query());
+        builder.push(" WHERE r.id = ?");
+        builder
+    }
+
+    pub fn folder<DB: sqlx::Database>(&self) -> QueryBuilder<DB> {
+        let mut builder = QueryBuilder::new(self.folder_query());
+        builder.push(" WHERE f.id = ?");
+        builder
+    }
+
+    pub const fn insert_media_track<'a>(&self) -> &'a str {
+        r#"INSERT INTO media_tracks(folder_id, path, modified_secs, file_size, title, artist, album,
+        album_artist, track_number, disc_number, duration_ms, sample_rate, channels, bit_depth,
+        codec, year, metadata_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2)
+        ON CONFLICT(path) DO UPDATE SET modified_secs=excluded.modified_secs, file_size=excluded.file_size,
+        title=excluded.title, artist=excluded.artist, album=excluded.album,
+        album_artist=excluded.album_artist, track_number=excluded.track_number, disc_number=excluded.disc_number,
+        duration_ms=excluded.duration_ms, sample_rate=excluded.sample_rate, channels=excluded.channels,
+        bit_depth=excluded.bit_depth, codec=excluded.codec, year=excluded.year, metadata_version=2,
+        missing=0 RETURNING id"#
+    }
+
+    pub const fn insert_track<'a>(&self) -> &'a str {
+        r#"INSERT INTO tracks(media_id, logical_index, cue_path, start_frame,
+        end_frame, title, artist, album, album_artist, track_number,
+        disc_number, duration_ms, sample_rate, channels, bit_depth, codec, year)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(media_id, logical_index) DO UPDATE SET cue_path=excluded.cue_path,
+        start_frame=excluded.start_frame, end_frame=excluded.end_frame, title=excluded.title,
+        artist=excluded.artist, album=excluded.album, album_artist=excluded.album_artist,
+        track_number=excluded.track_number, disc_number=excluded.disc_number,
+        duration_ms=excluded.duration_ms, sample_rate=excluded.sample_rate,
+        channels=excluded.channels, bit_depth=excluded.bit_depth, codec=excluded.codec,
+        year=excluded.year, missing=0"#
     }
 }
 
@@ -83,7 +179,10 @@ impl Store {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            query_composer: Default::default(),
+        };
         store
             .interrupt_scans(ScanStatus::Cancelled, "Scan interrupted")
             .await?;
@@ -105,20 +204,12 @@ impl Store {
         filter: &LibraryFilter,
     ) -> Result<LibraryPage> {
         let mut tx = self.pool.begin().await?;
-        let mut count = track_query(
-            "SELECT count(*) FROM tracks t JOIN media_tracks m ON m.id=t.media_id JOIN folders f ON f.id=m.folder_id",
-            query,
-            filter,
-        );
+        let mut count = track_query(self.query_composer.tracks_count(), query, filter);
         let total = count
             .build_query_scalar::<i64>()
             .fetch_one(&mut *tx)
             .await?;
-        let mut tracks = track_query(
-            "SELECT t.*, m.path FROM tracks t JOIN media_tracks m ON m.id=t.media_id JOIN folders f ON f.id=m.folder_id",
-            query,
-            filter,
-        );
+        let mut tracks = track_query(self.query_composer.tracks(), query, filter);
         if matches!(filter, LibraryFilter::Album(_)) {
             tracks.push(" ORDER BY COALESCE(t.disc_number, 1), t.track_number IS NULL, t.track_number, t.title COLLATE NOCASE, t.id");
         } else {
@@ -129,10 +220,16 @@ impl Store {
             .push_bind(PAGE_SIZE as i64)
             .push(" OFFSET ")
             .push_bind(i64::try_from(offset)?);
-        let rows = tracks.build().fetch_all(&mut *tx).await?;
+        let rows = tracks
+            .build()
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(track_from_row)
+            .collect::<Result<Vec<_>>>()?;
         tx.commit().await?;
         Ok(LibraryPage {
-            tracks: std::sync::Arc::new(rows.iter().map(track_from_row).collect::<Result<_>>()?),
+            tracks: rows.into(),
             total: total as u64,
             offset,
             query: query.into(),
@@ -143,7 +240,7 @@ impl Store {
     #[tracing::instrument(skip_all, err)]
     pub async fn album_tracks(&self, key: &AlbumKey) -> Result<Vec<Track>> {
         let mut query = track_query(
-            "SELECT t.*, m.path FROM tracks t JOIN media_tracks m ON m.id=t.media_id JOIN folders f ON f.id=m.folder_id",
+            self.query_composer.tracks(),
             "",
             &LibraryFilter::Album(key.clone()),
         );
@@ -152,7 +249,7 @@ impl Store {
             .build()
             .fetch_all(&self.pool)
             .await?
-            .iter()
+            .into_iter()
             .map(track_from_row)
             .collect()
     }
@@ -161,16 +258,19 @@ impl Store {
     pub async fn folders(&self, query: &str, offset: u64) -> Result<FolderPage> {
         let pattern = search_pattern(query);
         let mut tx = self.pool.begin().await?;
-        let total: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM folders WHERE display_path LIKE ? ESCAPE '!'")
-                .bind(&pattern)
-                .fetch_one(&mut *tx)
-                .await?;
-        let rows = sqlx::query("SELECT f.*, (SELECT count(*) FROM tracks t JOIN media_tracks m ON m.id=t.media_id WHERE m.folder_id=f.id AND t.missing=0) AS track_count FROM folders f WHERE display_path LIKE ? ESCAPE '!' ORDER BY display_path COLLATE NOCASE, path LIMIT ? OFFSET ?")
-            .bind(&pattern).bind(PAGE_SIZE as i64).bind(i64::try_from(offset)?).fetch_all(&mut *tx).await?;
+        let total: i64 = sqlx::query_scalar(self.query_composer.folders_count())
+            .bind(&pattern)
+            .fetch_one(&mut *tx)
+            .await?;
+        let rows = sqlx::query(self.query_composer.folders())
+            .bind(&pattern)
+            .bind(PAGE_SIZE as i64)
+            .bind(i64::try_from(offset)?)
+            .fetch_all(&mut *tx)
+            .await?;
         tx.commit().await?;
         let folders = rows
-            .iter()
+            .into_iter()
             .map(|row| {
                 Ok(FolderSummary {
                     id: row.try_get("id")?,
@@ -194,29 +294,18 @@ impl Store {
     pub async fn albums(&self, query: &str, offset: u64) -> Result<AlbumPage> {
         let pattern = search_pattern(query);
         let mut tx = self.pool.begin().await?;
-        let total: i64 = sqlx::query_scalar("SELECT count(*) FROM (SELECT album, COALESCE(NULLIF(album_artist, ''), artist) AS group_artist FROM tracks GROUP BY album, group_artist HAVING album LIKE ? ESCAPE '!' OR group_artist LIKE ? ESCAPE '!')")
-            .bind(&pattern).bind(&pattern).fetch_one(&mut *tx).await?;
-        let rows = sqlx::query(
-            "SELECT t.album, COALESCE(NULLIF(t.album_artist, ''), t.artist) AS group_artist,
-                    count(*) AS track_count, sum(t.duration_ms) AS duration_ms, min(t.year) AS year,
-                    (SELECT m.path FROM tracks a JOIN media_tracks m ON m.id=a.media_id
-                     WHERE a.album=t.album
-                       AND COALESCE(NULLIF(a.album_artist, ''), a.artist)
-                           = COALESCE(NULLIF(t.album_artist, ''), t.artist)
-                       AND a.missing=0
-                     ORDER BY COALESCE(a.disc_number, 1), a.track_number IS NULL,
-                              a.track_number, a.id LIMIT 1) AS artwork_path
-             FROM tracks t GROUP BY t.album, group_artist
-             HAVING t.album LIKE ? ESCAPE '!' OR group_artist LIKE ? ESCAPE '!'
-             ORDER BY t.album COLLATE NOCASE, group_artist COLLATE NOCASE,
-                      t.album, group_artist LIMIT ? OFFSET ?",
-        )
-        .bind(&pattern)
-        .bind(&pattern)
-        .bind(PAGE_SIZE as i64)
-        .bind(i64::try_from(offset)?)
-        .fetch_all(&mut *tx)
-        .await?;
+        let total: i64 = sqlx::query_scalar(self.query_composer.albums_count())
+            .bind(&pattern)
+            .bind(&pattern)
+            .fetch_one(&mut *tx)
+            .await?;
+        let rows = sqlx::query(self.query_composer.albums())
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(PAGE_SIZE as i64)
+            .bind(i64::try_from(offset)?)
+            .fetch_all(&mut *tx)
+            .await?;
         tx.commit().await?;
         let albums = rows
             .iter()
@@ -300,9 +389,14 @@ impl Store {
 
     #[tracing::instrument(skip_all, fields(playlist_id = id), err)]
     pub async fn playlist_entries(&self, id: i64) -> Result<Vec<PlaylistEntry>> {
-        let rows = sqlx::query("SELECT tracks.*, m.path, playlist_entries.id AS entry_id FROM playlist_entries JOIN tracks ON tracks.id = playlist_entries.track_id JOIN media_tracks m ON m.id=tracks.media_id WHERE playlist_entries.playlist_id = ? ORDER BY playlist_entries.position, playlist_entries.id")
-            .bind(id).fetch_all(&self.pool).await?;
-        rows.iter()
+        let rows = sqlx::query(
+            r#"SELECT tracks.*, m.path, playlist_entries.id AS entry_id
+            FROM playlist_entries JOIN tracks ON tracks.id = playlist_entries.track_id JOIN media_tracks m ON m.id=tracks.media_id
+            WHERE playlist_entries.playlist_id = ? ORDER BY playlist_entries.position, playlist_entries.id"#
+        )
+        .bind(id)
+        .fetch_all(&self.pool).await?;
+        rows.into_iter()
             .map(|row| {
                 Ok(PlaylistEntry {
                     id: row.try_get("entry_id")?,
@@ -406,8 +500,13 @@ impl Store {
 
     #[tracing::instrument(skip_all, fields(key), err)]
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
-        sqlx::query("INSERT INTO settings(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-            .bind(key).bind(value).execute(&self.pool).await?;
+        sqlx::query(
+            "INSERT INTO settings(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -462,8 +561,14 @@ impl Store {
     }
 
     pub(crate) async fn begin_root_scan(&self, id: i64) -> Result<i64> {
-        Ok(sqlx::query_scalar("UPDATE scan_folders SET generation = generation + 1, status = 'scanning', error = NULL WHERE id = ? RETURNING generation")
-            .bind(id).fetch_one(&self.pool).await?)
+        Ok(sqlx::query_scalar(
+            r#"UPDATE scan_folders
+            SET generation = generation + 1, status = 'scanning', error = NULL
+            WHERE id = ? RETURNING generation"#,
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     pub(crate) async fn root_status(
@@ -482,13 +587,27 @@ impl Store {
     }
 
     pub(crate) async fn root_folders(&self, id: i64) -> Result<Vec<FolderRecord>> {
-        sqlx::query("SELECT f.id, f.path, f.scan_folder_id, r.generation FROM folders f JOIN scan_folders r ON r.id = f.scan_folder_id WHERE r.id = ? ORDER BY f.path")
-            .bind(id).fetch_all(&self.pool).await?.iter().map(folder_from_row).collect()
+        self.query_composer
+            .root_folder()
+            .push(" ORDER BY f.path")
+            .build()
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(folder_from_row)
+            .collect()
     }
 
     pub(crate) async fn folder(&self, id: i64) -> Result<FolderRecord> {
-        folder_from_row(&sqlx::query("SELECT f.id, f.path, f.scan_folder_id, r.generation FROM folders f JOIN scan_folders r ON r.id = f.scan_folder_id WHERE f.id = ?")
-            .bind(id).fetch_one(&self.pool).await?)
+        folder_from_row(
+            self.query_composer
+                .folder()
+                .build()
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await?,
+        )
     }
 
     pub(crate) async fn ensure_folder(
@@ -496,8 +615,15 @@ impl Store {
         root: &RootRecord,
         path: &Path,
     ) -> Result<FolderRecord> {
-        let id: i64 = sqlx::query_scalar("INSERT INTO folders(scan_folder_id, path, display_path) VALUES (?, ?, ?) ON CONFLICT(path) DO UPDATE SET scan_folder_id = excluded.scan_folder_id RETURNING id")
-            .bind(root.id).bind(encode_path(path)).bind(path.to_string_lossy().as_ref()).fetch_one(&self.pool).await?;
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO folders(scan_folder_id, path, display_path)
+            VALUES (?, ?, ?) ON CONFLICT(path) DO UPDATE SET scan_folder_id = excluded.scan_folder_id RETURNING id"
+        )
+        .bind(root.id)
+        .bind(encode_path(path))
+        .bind(path.to_string_lossy().as_ref())
+        .fetch_one(&self.pool)
+        .await?;
         Ok(FolderRecord {
             id,
             path: path.into(),
@@ -525,7 +651,7 @@ impl Store {
             .bind(id)
             .fetch_all(&self.pool)
             .await?
-            .iter()
+            .into_iter()
             .map(|row| {
                 Ok(MediaRecord {
                     path: decode_path(row.try_get("path")?)?,
@@ -553,9 +679,17 @@ impl Store {
         for item in media {
             let file = item.media;
             let meta = &file.metadata;
-            let media_id: i64 = bind_metadata(sqlx::query("INSERT INTO media_tracks(folder_id, path, modified_secs, file_size, title, artist, album, album_artist, track_number, disc_number, duration_ms, sample_rate, channels, bit_depth, codec, year, metadata_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2) ON CONFLICT(path) DO UPDATE SET modified_secs=excluded.modified_secs, file_size=excluded.file_size, title=excluded.title, artist=excluded.artist, album=excluded.album, album_artist=excluded.album_artist, track_number=excluded.track_number, disc_number=excluded.disc_number, duration_ms=excluded.duration_ms, sample_rate=excluded.sample_rate, channels=excluded.channels, bit_depth=excluded.bit_depth, codec=excluded.codec, year=excluded.year, metadata_version=2, missing=0 RETURNING id")
-                .bind(folder.id).bind(encode_path(&file.path)).bind(file.modified_secs).bind(i64::try_from(file.file_size)?), meta)?
-                .fetch_one(&mut *tx).await?.try_get("id")?;
+            let media_id: i64 = bind_metadata(
+                sqlx::query(self.query_composer.insert_media_track())
+                    .bind(folder.id)
+                    .bind(encode_path(&file.path))
+                    .bind(file.modified_secs)
+                    .bind(i64::try_from(file.file_size)?),
+                meta,
+            )?
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get("id")?;
             for track in item.tracks {
                 let start = track
                     .segment
@@ -566,9 +700,17 @@ impl Store {
                     .and_then(|s| s.end_frame)
                     .map(i64::try_from)
                     .transpose()?;
-                bind_metadata(sqlx::query("INSERT INTO tracks(media_id, logical_index, cue_path, start_frame, end_frame, title, artist, album, album_artist, track_number, disc_number, duration_ms, sample_rate, channels, bit_depth, codec, year) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(media_id, logical_index) DO UPDATE SET cue_path=excluded.cue_path, start_frame=excluded.start_frame, end_frame=excluded.end_frame, title=excluded.title, artist=excluded.artist, album=excluded.album, album_artist=excluded.album_artist, track_number=excluded.track_number, disc_number=excluded.disc_number, duration_ms=excluded.duration_ms, sample_rate=excluded.sample_rate, channels=excluded.channels, bit_depth=excluded.bit_depth, codec=excluded.codec, year=excluded.year, missing=0")
-                    .bind(media_id).bind(track.index).bind(track.cue_path.as_deref().map(encode_path)).bind(start).bind(end), &track.metadata)?
-                    .execute(&mut *tx).await?;
+                bind_metadata(
+                    sqlx::query(self.query_composer.insert_track())
+                        .bind(media_id)
+                        .bind(track.index)
+                        .bind(track.cue_path.as_deref().map(encode_path))
+                        .bind(start)
+                        .bind(end),
+                    &track.metadata,
+                )?
+                .execute(&mut *tx)
+                .await?;
             }
         }
         sqlx::query(
@@ -657,7 +799,7 @@ fn track_query(prefix: &'static str, query: &str, filter: &LibraryFilter) -> Que
     builder
 }
 
-fn track_from_row(row: &SqliteRow) -> Result<Track> {
+fn track_from_row(row: SqliteRow) -> Result<Track> {
     Ok(Track {
         id: row.try_get("id")?,
         path: decode_path(row.try_get("path")?)?,
@@ -725,14 +867,14 @@ fn root_from_row(row: &SqliteRow) -> Result<RootRecord> {
         generation: row.try_get("generation")?,
     })
 }
-fn folder_from_row(row: &SqliteRow) -> Result<FolderRecord> {
+fn folder_from_row(row: SqliteRow) -> Result<FolderRecord> {
     Ok(FolderRecord {
         id: row.try_get("id")?,
         path: decode_path(row.try_get("path")?)?,
         generation: row.try_get("generation")?,
     })
 }
-fn metadata_from_row(row: &SqliteRow) -> Result<TrackMetadata> {
+fn metadata_from_row(row: SqliteRow) -> Result<TrackMetadata> {
     Ok(TrackMetadata {
         title: row.try_get("title")?,
         artist: row.try_get("artist")?,

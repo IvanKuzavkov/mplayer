@@ -25,7 +25,10 @@ async fn album_year_migration_preserves_catalog_and_refreshes_old_cached_metadat
         .run_to(1, &pool)
         .await
         .unwrap();
-    let old = Store { pool };
+    let old = Store {
+        pool,
+        query_composer: Default::default(),
+    };
     let root = old.register_root(&temp.0).await.unwrap();
     let folder = old.ensure_folder(&root, &temp.0).await.unwrap();
     let path = temp.0.join("one.flac");
