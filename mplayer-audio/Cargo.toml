@@ -14,3 +14,6 @@ tokio.workspace = true
 tracing.workspace = true
 dst-decoder = "=0.1.2"
 rayon = "1.12.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"

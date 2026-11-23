@@ -23,6 +23,10 @@ pub(super) async fn run(
         scans.spawn_blocking(move || {
             span.in_scope(|| {
                 let started = std::time::Instant::now();
+                // Core Audio autoreleases temporary objects during enumeration.
+                #[cfg(target_os = "macos")]
+                let devices = objc2::rc::autoreleasepool(|_| enumerate());
+                #[cfg(not(target_os = "macos"))]
                 let devices = enumerate();
                 if started.elapsed() >= Duration::from_millis(50) {
                     tracing::warn!(
