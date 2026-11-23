@@ -6,14 +6,12 @@ fn device_name(device: &str) -> &str {
 
 fn device_label(ui: &egui::Ui, device: &mplayer_core::OutputDevice) -> egui::text::LayoutJob {
     let mut label = egui::text::LayoutJob::default();
-    RichText::new(device_name(&device.id))
-        .color(ui.visuals().text_color())
-        .append_to(
-            &mut label,
-            ui.style(),
-            egui::FontSelection::Default,
-            egui::Align::Center,
-        );
+    RichText::new(device_name(&device.id)).append_to(
+        &mut label,
+        ui.style(),
+        egui::FontSelection::Default,
+        egui::Align::Center,
+    );
     if let Some(capabilities) = device.capabilities {
         RichText::new(format!(
             "\nPCM up to {} kHz · {}-bit{} · {} ch",
